@@ -135,6 +135,8 @@ mod tests {
 
     #[test]
     fn grapheme_combining_and_zwj_sequences_cross_chunks() {
+        let extended_before_joiner = format!("a👩{}\u{200d}👩b", "\u{301}".repeat(1200));
+        assert_boundaries(&extended_before_joiner, true);
         let combining = format!("ae{}b", "\u{301}".repeat(1200));
         assert_boundaries(&combining, true);
         let joined = format!("a👩{}b", "\u{301}\u{200d}👩".repeat(350));
