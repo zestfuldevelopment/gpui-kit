@@ -1,5 +1,8 @@
 //! Text input: the shared editing engine and the three states built on it.
 //!
+//! Left/Right, Shift-Left/Right, and Backspace/Delete operate on extended graphemes.
+//! Programmatic selections and replacements retain exact scalar-boundary byte ranges.
+//!
 //! Nothing here should be `pub` unless it is reachable from outside the crate.
 //! A `pub` on an item behind a private module says something the module path
 //! contradicts, and it hides the real API surface from anyone reading it.
@@ -26,6 +29,7 @@ mod display_map;
 mod editor;
 #[path = "base/element.rs"]
 mod element;
+mod grapheme;
 #[path = "editor/highlighting.rs"]
 mod highlighting;
 #[path = "editor/indent.rs"]

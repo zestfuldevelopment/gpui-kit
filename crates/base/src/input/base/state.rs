@@ -25,6 +25,7 @@ use super::{
     blink_cursor::BlinkCursor,
     change::Change,
     element::{EditorScrollbar, EditorScrollbarSnapshot, TextElement},
+    grapheme,
     kind::InputModeKind,
     mask_pattern::normalize_number_input,
     mode::LayoutMode,
@@ -1208,12 +1209,12 @@ impl<M: InputModeKind> InputBaseState<M> {
 
     pub(super) fn select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
         self.undo_manager.break_transaction_coalescing();
-        self.select_to(self.previous_boundary(self.cursor()), cx);
+        self.select_grapheme_to(self.previous_grapheme_boundary(self.cursor()), cx);
     }
 
     pub(super) fn select_right(&mut self, _: &SelectRight, _: &mut Window, cx: &mut Context<Self>) {
         self.undo_manager.break_transaction_coalescing();
-        self.select_to(self.next_boundary(self.cursor()), cx);
+        self.select_grapheme_to(self.next_grapheme_boundary(self.cursor()), cx);
     }
 
     pub(super) fn select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
@@ -1477,26 +1478,51 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     pub(super) fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
-        let intent = if self.selected_range.is_empty() {
-            self.select_to(self.previous_boundary(self.cursor()), cx);
-            EditIntent::Backspace
-        } else {
-            EditIntent::Atomic
-        };
-        self.undo_manager.pending_intent = Some(intent);
-        self.replace_text_in_range(None, "", window, cx);
-        self.pause_blink_cursor(cx);
+        self.delete_grapheme(true, window, cx);
     }
 
     pub(super) fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
-        let intent = if self.selected_range.is_empty() {
-            self.select_to(self.next_boundary(self.cursor()), cx);
-            EditIntent::DeleteForward
+        self.delete_grapheme(false, window, cx);
+    }
+
+    fn delete_grapheme(&mut self, backwards: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_range.is_empty() {
+            // Retain the cursor effects previously supplied by select_to, without
+            // replacing the selection that validation and history must observe.
+            M::clear_inline_completion(self, cx);
+            self.cursor_line_end_affinity = false;
+        }
+        let range = if self.selected_range.is_empty() {
+            let offset = self.cursor();
+            let floor = grapheme::floor(&self.text, offset);
+            let ceil = grapheme::ceil(&self.text, offset);
+            if floor != ceil {
+                floor..ceil
+            } else if backwards {
+                self.previous_grapheme_boundary(offset)..offset
+            } else {
+                offset..self.next_grapheme_boundary(offset)
+            }
         } else {
-            EditIntent::Atomic
+            grapheme::floor(&self.text, self.selected_range.start)
+                ..grapheme::ceil(&self.text, self.selected_range.end)
         };
+        let intent = if !self.selected_range.is_empty() {
+            EditIntent::Atomic
+        } else if backwards {
+            EditIntent::Backspace
+        } else {
+            EditIntent::DeleteForward
+        };
+        // Pass the edit range separately: history and rejected edits must retain
+        // the original caret/selection, even when it lies inside a grapheme.
+        // During composition, retain the IME marked range's existing precedence.
+        let range_utf16 = self
+            .ime_marked_range
+            .is_none()
+            .then(|| self.range_to_utf16(&range));
         self.undo_manager.pending_intent = Some(intent);
-        self.replace_text_in_range(None, "", window, cx);
+        self.replace_text_in_range(range_utf16, "", window, cx);
         self.pause_blink_cursor(cx);
     }
 
@@ -2021,11 +2047,6 @@ impl<M: InputModeKind> InputBaseState<M> {
             }
         });
 
-        let selection_before = match intent {
-            EditIntent::Backspace => Selection::new(range.end, range.end),
-            EditIntent::DeleteForward => Selection::new(range.start, range.start),
-            EditIntent::Typing | EditIntent::Atomic => selection_before,
-        };
         let selection_after =
             selection_after.unwrap_or_else(|| Selection::new(new_range.end, new_range.end));
 
@@ -2037,7 +2058,8 @@ impl<M: InputModeKind> InputBaseState<M> {
                 new_text,
                 selection_before,
                 selection_after,
-            ),
+            )
+            .with_selection_direction(self.selection_reversed),
             intent,
         );
     }
@@ -2062,11 +2084,13 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.undo_manager.set_ignoring(true);
         if let Some(changes) = self.undo_manager.undo() {
             let selection = changes.last().unwrap().selection_before;
+            let reversed = changes.last().unwrap().selection_before_reversed;
             for change in &changes {
                 let range_utf16 = self.range_to_utf16(&change.new_range.into());
                 self.replace_text_in_range_silent(Some(range_utf16), &change.old_text, window, cx);
             }
             self.selected_range = selection;
+            self.selection_reversed = reversed;
         }
         self.undo_manager.set_ignoring(false);
     }
@@ -2075,11 +2099,13 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.undo_manager.set_ignoring(true);
         if let Some(changes) = self.undo_manager.redo() {
             let selection = changes.last().unwrap().selection_after;
+            let reversed = changes.last().unwrap().selection_after_reversed;
             for change in &changes {
                 let range_utf16 = self.range_to_utf16(&change.old_range.into());
                 self.replace_text_in_range_silent(Some(range_utf16), &change.new_text, window, cx);
             }
             self.selected_range = selection;
+            self.selection_reversed = reversed;
         }
         self.undo_manager.set_ignoring(false);
     }
@@ -2348,6 +2374,26 @@ impl<M: InputModeKind> InputBaseState<M> {
             }
         }
         offset
+    }
+
+    pub(super) fn previous_grapheme_boundary(&self, offset: usize) -> usize {
+        let offset = self.clamp_offset_to_visible_backward(grapheme::previous(&self.text, offset));
+        // The fold header's line-end offset can be between CR and LF.
+        grapheme::floor(&self.text, offset)
+    }
+
+    pub(super) fn next_grapheme_boundary(&self, offset: usize) -> usize {
+        self.clamp_offset_to_visible_forward(grapheme::next(&self.text, offset))
+    }
+
+    fn select_grapheme_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        // Compute the step before moving the anchor. An interior anchor expands
+        // to the opposite edge of its cluster on the first nonempty selection.
+        self.select_to(offset, cx);
+        if !self.selected_range.is_empty() {
+            self.selected_range.start = grapheme::floor(&self.text, self.selected_range.start);
+            self.selected_range.end = grapheme::ceil(&self.text, self.selected_range.end);
+        }
     }
 
     pub(super) fn previous_boundary(&self, offset: usize) -> usize {
@@ -3202,6 +3248,8 @@ impl<M: InputModeKind> Render for InputBaseState<M> {
 
 #[cfg(test)]
 mod tests {
+    include!("grapheme_tests.rs");
+
     use super::*;
 
     use crate::theme::Theme;

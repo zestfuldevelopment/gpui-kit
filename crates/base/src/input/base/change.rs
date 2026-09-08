@@ -10,10 +10,18 @@ pub(super) struct Change {
     pub(crate) new_text: String,
     pub(crate) selection_before: Selection,
     pub(crate) selection_after: Selection,
+    pub(crate) selection_before_reversed: bool,
+    pub(crate) selection_after_reversed: bool,
     version: usize,
 }
 
 impl Change {
+    pub(super) fn with_selection_direction(mut self, reversed: bool) -> Self {
+        self.selection_before_reversed = reversed;
+        self.selection_after_reversed = reversed;
+        self
+    }
+
     pub(super) fn new(
         old_range: impl Into<Selection>,
         old_text: &str,
@@ -29,6 +37,8 @@ impl Change {
             new_text: new_text.to_string(),
             selection_before,
             selection_after,
+            selection_before_reversed: false,
+            selection_after_reversed: false,
             version: 0,
         }
     }

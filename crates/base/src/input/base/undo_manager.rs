@@ -59,6 +59,7 @@ impl UndoManager {
                 pending.new_range = change.new_range;
                 pending.new_text = change.new_text;
                 pending.selection_after = change.selection_after;
+                pending.selection_after_reversed = change.selection_after_reversed;
             } else {
                 self.pending_change = Some(change);
             }
