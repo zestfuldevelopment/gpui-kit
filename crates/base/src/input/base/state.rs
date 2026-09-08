@@ -2042,6 +2042,22 @@ impl<M: InputModeKind> InputBaseState<M> {
         );
     }
 
+    /// Prevent subsequent edits from coalescing with earlier undo history.
+    ///
+    /// Call this after a successful save to make the saved text an undo boundary.
+    /// Text, selection, caret, focus, scroll, and IME marked text are preserved;
+    /// this does not emit a change event or require a redraw.
+    ///
+    /// An active IME composition remains active, but its undo transaction is split
+    /// at the boundary. Later composition updates undo back to the saved preedit.
+    /// Repeated calls without edits add no undo entries and preserve redo history.
+    pub fn break_undo_coalescing(&mut self) {
+        self.undo_manager.break_transaction_coalescing();
+        if self.ime_marked_range.is_some() {
+            self.undo_manager.begin_transaction();
+        }
+    }
+
     pub(super) fn undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
         self.undo_manager.set_ignoring(true);
         if let Some(changes) = self.undo_manager.undo() {
@@ -3644,6 +3660,193 @@ mod tests {
                 assert_eq!(state.value(), "");
             });
         });
+    }
+
+    #[gpui::test]
+    fn test_undo_boundary_splits_typing_and_preserves_redo(cx: &mut TestAppContext) {
+        let input_view = InputView::new(cx);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                for part in ["a", "b"] {
+                    state.replace_text_in_range(None, part, window, cx);
+                }
+                state.break_undo_coalescing();
+                state.break_undo_coalescing();
+                for part in ["c", "d"] {
+                    state.replace_text_in_range(None, part, window, cx);
+                }
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.value(), "ab");
+                state.break_undo_coalescing();
+                state.break_undo_coalescing();
+                state.redo(&Redo, window, cx);
+                assert_eq!(state.value(), "abcd");
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.value(), "ab");
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.value(), "");
+                assert!(!state.undo_manager.has_undos());
+                state.redo(&Redo, window, cx);
+                assert_eq!(state.value(), "ab");
+                state.redo(&Redo, window, cx);
+                assert_eq!(state.value(), "abcd");
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn test_undo_boundary_splits_active_composition(cx: &mut TestAppContext) {
+        let input_view = InputView::new(cx);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("a", window, cx);
+                state.set_selected_range(1..1, cx);
+                state.replace_and_mark_text_in_range(None, "s", None, window, cx);
+                state.break_undo_coalescing();
+                // IMEs may repeat the saved preedit before updating it.
+                state.replace_and_mark_text_in_range(None, "s", None, window, cx);
+                state.replace_and_mark_text_in_range(None, "sh", None, window, cx);
+                state.replace_and_mark_text_in_range(None, "shi", None, window, cx);
+                state.replace_text_in_range(None, "是", window, cx);
+                assert_eq!(state.value(), "a是");
+
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.value(), "as");
+                assert_eq!(state.selected_range(), 2..2);
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.value(), "a");
+                assert!(!state.undo_manager.has_undos());
+                state.redo(&Redo, window, cx);
+                assert_eq!(state.value(), "as");
+                state.redo(&Redo, window, cx);
+                assert_eq!(state.value(), "a是");
+                assert_eq!(state.selected_range(), 4..4);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn test_undo_boundary_composition_cancellation_restores_saved_text(cx: &mut TestAppContext) {
+        let input_view = InputView::new(cx);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("a", window, cx);
+                state.set_selected_range(1..1, cx);
+                state.replace_and_mark_text_in_range(None, "s", None, window, cx);
+                state.break_undo_coalescing();
+                state.replace_and_mark_text_in_range(None, "sh", None, window, cx);
+                state.replace_and_mark_text_in_range(None, "", None, window, cx);
+                assert_eq!(state.value(), "a");
+                assert!(state.ime_marked_range.is_none());
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.value(), "as");
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.value(), "a");
+                assert!(!state.undo_manager.has_undos());
+                state.redo(&Redo, window, cx);
+                assert_eq!(state.value(), "as");
+                state.redo(&Redo, window, cx);
+                assert_eq!(state.value(), "a");
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn test_undo_boundary_unchanged_composition_has_no_empty_entries(cx: &mut TestAppContext) {
+        let input_view = InputView::new(cx);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                for confirm in [false, true] {
+                    state.set_value("a", window, cx);
+                    state.set_selected_range(1..1, cx);
+                    state.replace_and_mark_text_in_range(None, "s", None, window, cx);
+                    state.break_undo_coalescing();
+                    state.break_undo_coalescing();
+                    state.replace_and_mark_text_in_range(None, "s", None, window, cx);
+                    if confirm {
+                        state.replace_text_in_range(None, "s", window, cx);
+                    } else {
+                        state.unmark_text(window, cx);
+                    }
+                    state.break_undo_coalescing();
+                    state.undo(&Undo, window, cx);
+                    assert_eq!(state.value(), "a");
+                    assert!(!state.undo_manager.has_undos());
+                    state.redo(&Redo, window, cx);
+                    assert_eq!(state.value(), "as");
+                }
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn test_undo_boundary_preserves_editor_state_without_change_event(cx: &mut TestAppContext) {
+        let input_view = InputView::new(cx);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+        let changes = Rc::new(Cell::new(0));
+        let sink = changes.clone();
+        cx.update(|window, cx| {
+            cx.subscribe(&input, move |_, event: &InputEvent, _| {
+                if matches!(event, InputEvent::Change) {
+                    sink.set(sink.get() + 1);
+                }
+            })
+            .detach();
+            input.update(cx, |state, cx| {
+                state.set_value("abc", window, cx);
+                state.focus(window, cx);
+            });
+        });
+        changes.set(0);
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                for composing in [false, true] {
+                    if composing {
+                        state.replace_and_mark_text_in_range(None, "shi", None, window, cx);
+                    }
+                    state.selected_range = Selection::new(1, 2);
+                    state.selection_reversed = true;
+                    state.scroll_handle.set_offset(point(px(-12.), px(-24.)));
+                    state.deferred_scroll_offset = Some(point(px(-20.), px(-30.)));
+                    let text = state.value();
+                    let cursor = state.cursor();
+                    let marked_range = state.ime_marked_range;
+                    let focus = state.focus_handle.clone();
+                    let blink_visible = state.blink_cursor.read(cx).visible();
+
+                    state.break_undo_coalescing();
+                    state.break_undo_coalescing();
+
+                    assert_eq!(state.value(), text);
+                    assert_eq!(state.selected_range, Selection::new(1, 2));
+                    assert!(state.selection_reversed);
+                    assert_eq!(state.cursor(), cursor);
+                    assert_eq!(state.ime_marked_range, marked_range);
+                    assert_eq!(state.focus_handle, focus);
+                    assert!(state.focus_handle.is_focused(window));
+                    assert_eq!(state.blink_cursor.read(cx).visible(), blink_visible);
+                    assert_eq!(state.scroll_handle.offset(), point(px(-12.), px(-24.)));
+                    assert_eq!(
+                        state.deferred_scroll_offset,
+                        Some(point(px(-20.), px(-30.)))
+                    );
+                }
+            });
+        });
+        assert_eq!(changes.get(), 0);
     }
 
     #[gpui::test]

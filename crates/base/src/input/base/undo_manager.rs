@@ -52,12 +52,9 @@ impl UndoManager {
         if self.ignoring {
             return;
         }
-        if change.old_range == change.new_range && change.old_text == change.new_text {
-            self.break_transaction_coalescing();
-            return;
-        }
-
         if self.transaction_open {
+            // Identical IME callbacks still belong to the open composition.
+            // Committing the transaction discards any net-zero change.
             if let Some(pending) = self.pending_change.as_mut() {
                 pending.new_range = change.new_range;
                 pending.new_text = change.new_text;
@@ -65,6 +62,8 @@ impl UndoManager {
             } else {
                 self.pending_change = Some(change);
             }
+        } else if change.old_range == change.new_range && change.old_text == change.new_text {
+            self.break_transaction_coalescing();
         } else {
             self.push_transaction(change, intent);
         }
