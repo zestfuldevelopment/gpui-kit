@@ -5,8 +5,15 @@ use gpui::{Context, Window};
 use ropey::Rope;
 use sum_tree::Bias;
 
-use super::{InputBaseState, RopeExt as _};
+use super::{InputBaseState, RopeExt as _, Selection};
 use crate::text_boundary::word_range_from_chars;
+
+/// The unit selected at mouse-down remains the anchor until mouse-up.
+#[derive(Clone, Copy)]
+pub(super) enum MouseSelection {
+    Word(Selection),
+    Line(Selection),
+}
 
 impl<M: InputModeKind> InputBaseState<M> {
     /// Select the word at the given offset on double-click.
@@ -27,7 +34,8 @@ impl<M: InputModeKind> InputBaseState<M> {
 
         self.undo_manager.break_transaction_coalescing();
         self.selected_range = (range.start..range.end).into();
-        self.selected_word_range = Some(self.selected_range);
+        self.selection_reversed = false;
+        self.mouse_selection = Some(MouseSelection::Word(self.selected_range));
         cx.notify()
     }
 
@@ -38,8 +46,46 @@ impl<M: InputModeKind> InputBaseState<M> {
         let range = TextSelector::line_range(&self.text, offset);
         self.undo_manager.break_transaction_coalescing();
         self.selected_range = (range.start..range.end).into();
-        self.selected_word_range = None;
+        self.selection_reversed = false;
+        self.mouse_selection = Some(MouseSelection::Line(self.selected_range));
         cx.notify()
+    }
+
+    /// Extend a pointer gesture using its initial granularity, including timer-driven autoscroll.
+    pub(super) fn select_by_mouse(
+        &mut self,
+        offset: usize,
+        line_end_affinity: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(selection) = self.mouse_selection else {
+            self.select_to_with_affinity(offset, line_end_affinity, cx);
+            return;
+        };
+        let offset = offset.min(self.text.len());
+        let (anchor, target) = match selection {
+            MouseSelection::Word(anchor) => {
+                let target = if self.masked {
+                    0..self.text.len()
+                } else {
+                    TextSelector::word_range(&self.text, offset).unwrap_or(offset..offset)
+                };
+                (anchor, target)
+            }
+            MouseSelection::Line(anchor) => (anchor, TextSelector::line_range(&self.text, offset)),
+        };
+
+        // Rebuild from the original unit on every move: reversing across it must
+        // switch the fixed edge, not leave the previous drag endpoint anchored.
+        self.selected_range = anchor;
+        self.selection_reversed = offset < anchor.start;
+        let endpoint = if self.selection_reversed {
+            target.start.min(anchor.start)
+        } else {
+            target.end.max(anchor.end)
+        };
+        // Snapped endpoints describe text boundaries, not the pointer's soft-wrap affinity.
+        self.select_to_with_affinity(endpoint, false, cx);
     }
 }
 

@@ -29,6 +29,7 @@ use super::{
     kind::InputModeKind,
     mask_pattern::normalize_number_input,
     mode::LayoutMode,
+    selection::MouseSelection,
     undo_manager::{EditIntent, UndoManager},
 };
 use crate::actions::{SelectDown, SelectLeft, SelectRight, SelectUp};
@@ -302,8 +303,8 @@ pub struct InputBaseState<M: InputModeKind> {
     /// - "Hello 世界💝" = 16
     /// - "💝" = 4
     pub(super) selected_range: Selection,
-    /// Range for save the selected word, use to keep word range when drag move.
-    pub(super) selected_word_range: Option<Selection>,
+    /// Initial word or line anchor for the active pointer gesture.
+    pub(super) mouse_selection: Option<MouseSelection>,
     pub(super) selection_reversed: bool,
     /// The marked range is the temporary insert text on IME typing.
     pub(super) ime_marked_range: Option<Selection>,
@@ -627,7 +628,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             blink_cursor,
             undo_manager,
             selected_range: Selection::default(),
-            selected_word_range: None,
+            mouse_selection: None,
             selection_reversed: false,
             ime_marked_range: None,
             input_bounds: Bounds::default(),
@@ -1742,6 +1743,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             }
         }
 
+        self.mouse_selection = None;
         self.selecting = true;
         let (offset, line_end_affinity) = self.index_for_mouse_position(event.position);
 
@@ -1793,8 +1795,12 @@ impl<M: InputModeKind> InputBaseState<M> {
         if self.selected_range.is_empty() {
             self.selection_reversed = false;
         }
+        self.stop_mouse_selection();
+    }
+
+    fn stop_mouse_selection(&mut self) {
         self.selecting = false;
-        self.selected_word_range = None;
+        self.mouse_selection = None;
         self.auto_scroll.stop();
     }
 
@@ -2178,7 +2184,7 @@ impl<M: InputModeKind> InputBaseState<M> {
 
         self.move_to(start, None, cx);
         self.selection_reversed = false;
-        self.selected_word_range = None;
+        self.mouse_selection = None;
         self.select_to(end, cx);
     }
 
@@ -2305,15 +2311,6 @@ impl<M: InputModeKind> InputBaseState<M> {
             self.selected_range = (self.selected_range.end..self.selected_range.start).into();
         }
 
-        // Ensure keep word selected range
-        if let Some(word_range) = self.selected_word_range.as_ref() {
-            if self.selected_range.start > word_range.start {
-                self.selected_range.start = word_range.start;
-            }
-            if self.selected_range.end < word_range.end {
-                self.selected_range.end = word_range.end;
-            }
-        }
         if self.selected_range.is_empty() {
             self.update_preferred_column();
         }
@@ -2524,7 +2521,7 @@ impl<M: InputModeKind> InputBaseState<M> {
 
         self.auto_scroll.last_drag_position = Some(event.position);
         let (offset, line_end_affinity) = self.index_for_mouse_position(event.position);
-        self.select_to_with_affinity(offset, line_end_affinity, cx);
+        self.select_by_mouse(offset, line_end_affinity, cx);
 
         if !self.is_single_line() {
             let delta = AutoScroll::compute_delta(event.position.y, self.input_bounds);
@@ -2535,7 +2532,7 @@ impl<M: InputModeKind> InputBaseState<M> {
                 state.update_scroll_offset(Some(point(current.x, current.y + delta)), cx);
                 if let Some(pos) = state.auto_scroll.last_drag_position {
                     let (offset, line_end_affinity) = state.index_for_mouse_position(pos);
-                    state.select_to_with_affinity(offset, line_end_affinity, cx);
+                    state.select_by_mouse(offset, line_end_affinity, cx);
                 }
             });
         }
@@ -2801,6 +2798,8 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         if !self.is_editable() {
             return;
         }
+        // A text edit invalidates the gesture's original word/line offsets.
+        self.stop_mouse_selection();
         let selection_before = self.selected_range;
 
         if self.blink_cursor.read(cx).visible() {
@@ -2942,6 +2941,8 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         if !self.is_editable() {
             return;
         }
+        // A text edit invalidates the gesture's original word/line offsets.
+        self.stop_mouse_selection();
         let selection_before = self.selected_range;
 
         let starts_composition = self.ime_marked_range.is_none();
@@ -3249,6 +3250,7 @@ impl<M: InputModeKind> Render for InputBaseState<M> {
 #[cfg(test)]
 mod tests {
     include!("grapheme_tests.rs");
+    include!("mouse_selection_tests.rs");
 
     use super::*;
 
