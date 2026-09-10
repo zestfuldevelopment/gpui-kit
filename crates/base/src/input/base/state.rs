@@ -1442,7 +1442,7 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// Inherit whitespace from the start of the replacement, independent of
     /// which end of a selection carries the caret.
     pub(super) fn indent_of_next_line(&self) -> String {
-        let row = self.text.offset_to_point(self.selected_range.start).row as usize;
+        let row = self.text.offset_to_point(self.selected_range.start).row;
         self.text
             .slice(self.text.line_start_offset(row)..)
             .chars()

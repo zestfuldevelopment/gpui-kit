@@ -39,8 +39,8 @@ pub(super) fn newline_indent(
     ) {
         return None;
     }
-    let line_start = text.line_start_offset(text.offset_to_point(selection.start).row as usize);
-    let line_end = text.line_end_offset(text.offset_to_point(selection.end).row as usize);
+    let line_start = text.line_start_offset(text.offset_to_point(selection.start).row);
+    let line_end = text.line_end_offset(text.offset_to_point(selection.end).row);
     if selection.start - line_start > MAX_LINE_BYTES || line_end - selection.end > MAX_LINE_BYTES {
         return None;
     }
@@ -356,7 +356,7 @@ fn opening_tag(token: &Token<'_>, text: &Rope, language: &str) -> Option<String>
 }
 
 fn line_indent(text: &Rope, offset: usize) -> Option<String> {
-    let start = text.line_start_offset(text.offset_to_point(offset).row as usize);
+    let start = text.line_start_offset(text.offset_to_point(offset).row);
     if offset - start > MAX_LINE_BYTES {
         return None;
     }
