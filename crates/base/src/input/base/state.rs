@@ -1645,8 +1645,18 @@ impl<M: InputModeKind> InputBaseState<M> {
                 "".to_string()
             };
 
-            // Add newline and indent
-            let new_line_text = format!("\n{}", indent);
+            // Follow the first existing line break, including in mixed text.
+            // Read the rope's line index instead of scanning the whole document.
+            // A document without an LF (including a lone CR) defaults to LF.
+            let first_break = self.text.line_end_offset(0);
+            let line_break = if first_break < self.text.len()
+                && self.text.char_at(first_break.saturating_sub(1)) == Some('\r')
+            {
+                "\r\n"
+            } else {
+                "\n"
+            };
+            let new_line_text = format!("{line_break}{indent}");
             self.replace_text_in_range_silent(None, &new_line_text, window, cx);
             self.pause_blink_cursor(cx);
         } else {
