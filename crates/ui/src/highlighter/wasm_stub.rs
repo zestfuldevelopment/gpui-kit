@@ -242,8 +242,9 @@ impl SyntaxColors {
             "hint" => self.hint,
             "keyword" => self.keyword,
             "label" => self.label,
-            "link_text" => self.link_text,
-            "link_uri" => self.link_uri,
+            // Markdown block and inline queries use different link captures.
+            "link_text" | "text.reference" => self.link_text,
+            "link_uri" | "text.uri" => self.link_uri,
             "number" => self.number,
             "operator" => self.operator,
             "predictive" => self.predictive,
