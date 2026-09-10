@@ -1439,43 +1439,15 @@ impl<M: InputModeKind> InputBaseState<M> {
         line
     }
 
-    /// Get indent string of next line.
-    ///
-    /// To get current and next line indent, to return more depth one.
-    pub(super) fn indent_of_next_line(&mut self) -> String {
-        if self.is_single_line() {
-            return "".into();
-        }
-
-        let mut current_indent = String::new();
-        let mut next_indent = String::new();
-        let current_line_start_pos = self.start_of_line();
-        let next_line_start_pos = self.end_of_line();
-        for c in self.text.slice(current_line_start_pos..).chars() {
-            if !c.is_whitespace() {
-                break;
-            }
-            if c == '\n' || c == '\r' {
-                break;
-            }
-            current_indent.push(c);
-        }
-
-        for c in self.text.slice(next_line_start_pos..).chars() {
-            if !c.is_whitespace() {
-                break;
-            }
-            if c == '\n' || c == '\r' {
-                break;
-            }
-            next_indent.push(c);
-        }
-
-        if next_indent.len() > current_indent.len() {
-            return next_indent;
-        } else {
-            return current_indent;
-        }
+    /// Inherit whitespace from the start of the replacement, independent of
+    /// which end of a selection carries the caret.
+    pub(super) fn indent_of_next_line(&self) -> String {
+        let row = self.text.offset_to_point(self.selected_range.start).row as usize;
+        self.text
+            .slice(self.text.line_start_offset(row)..)
+            .chars()
+            .take_while(|c| c.is_whitespace() && !matches!(c, '\n' | '\r'))
+            .collect()
     }
 
     pub(super) fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
@@ -1638,7 +1610,21 @@ impl<M: InputModeKind> InputBaseState<M> {
         let insert_newline = self.is_multi_line() && (!self.submit_on_enter || action.shift);
 
         if insert_newline {
-            // Get current line indent
+            let mut replacement: Range<usize> = self.selected_range.into();
+            let language_indent = if self.is_editable() && self.ime_marked_range.is_none() {
+                self.mode.highlighter().and_then(|highlighter| {
+                    highlighter.borrow().as_ref().and_then(|highlighter| {
+                        highlighter.newline_indent(
+                            &self.text,
+                            replacement.clone(),
+                            &self.mode.tab_size().to_string(),
+                        )
+                    })
+                })
+            } else {
+                None
+            };
+            // Preserve inherited whitespace when the parser has no safe rule.
             let indent = if self.is_code_editor() {
                 self.indent_of_next_line()
             } else {
@@ -1656,8 +1642,36 @@ impl<M: InputModeKind> InputBaseState<M> {
             } else {
                 "\n"
             };
-            let new_line_text = format!("{line_break}{indent}");
-            self.replace_text_in_range_silent(None, &new_line_text, window, cx);
+            if let Some(plan) = language_indent {
+                let mut new_line_text = format!("{line_break}{}", plan.indent());
+                let caret = replacement.start + new_line_text.len();
+                if let Some(closing_indent) = plan.closing_indent() {
+                    replacement.end += self
+                        .text
+                        .slice(replacement.end..)
+                        .chars()
+                        .take_while(|c| matches!(c, ' ' | '\t'))
+                        .count();
+                    new_line_text.push_str(line_break);
+                    new_line_text.push_str(closing_indent);
+                }
+                let changed = replacement.len() != new_line_text.len()
+                    || !self
+                        .text
+                        .slice(replacement.clone())
+                        .chars()
+                        .eq(new_line_text.chars());
+                let range_utf16 = self.range_to_utf16(&replacement);
+                self.undo_manager.break_transaction_coalescing();
+                self.replace_text_in_range_silent(Some(range_utf16), &new_line_text, window, cx);
+                if changed {
+                    self.undo_manager.set_last_caret_after(caret);
+                }
+                self.move_to(caret, None, cx);
+            } else {
+                let new_line_text = format!("{line_break}{indent}");
+                self.replace_text_in_range_silent(None, &new_line_text, window, cx);
+            }
             self.pause_blink_cursor(cx);
         } else {
             // Single line input or submit-on-enter: just emit the event

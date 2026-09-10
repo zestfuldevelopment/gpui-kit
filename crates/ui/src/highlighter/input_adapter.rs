@@ -1,5 +1,5 @@
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     ops::Range,
     rc::Rc,
     sync::{
@@ -12,7 +12,7 @@ use std::{
 use gpui::{HighlightStyle, SharedString, Task};
 use gpui_base::input::{
     EditorState, FoldRange, HighlightStyleResolver, InputEdit as BaseInputEdit, InputHighlighter,
-    InputHighlighterFactory,
+    InputHighlighterFactory, NewlineIndent,
 };
 use ropey::Rope;
 use tree_sitter::{InputEdit, ParseOptions, Parser, Point};
@@ -31,6 +31,7 @@ pub(crate) fn input_highlighter_factory() -> InputHighlighterFactory {
 struct TreeSitterInputHighlighter {
     inner: Rc<RefCell<SyntaxHighlighter>>,
     parse_task: Rc<RefCell<Option<Task<()>>>>,
+    syntax_current: Rc<Cell<bool>>,
 }
 
 impl TreeSitterInputHighlighter {
@@ -38,6 +39,7 @@ impl TreeSitterInputHighlighter {
         Self {
             inner: Rc::new(RefCell::new(SyntaxHighlighter::new(language))),
             parse_task: Rc::new(RefCell::new(None)),
+            syntax_current: Rc::new(Cell::new(false)),
         }
     }
 }
@@ -70,6 +72,8 @@ impl InputHighlighter for TreeSitterInputHighlighter {
         const SYNC_PARSE_MAX_BYTES: usize = 256 * 1024;
         const PARSE_DEBOUNCE: Duration = Duration::from_millis(150);
 
+        let changed = !self.inner.borrow().text().eq(text);
+        let was_current = self.syntax_current.get();
         let edit = edit.map(to_tree_sitter_edit);
         let completed = {
             let mut highlighter = self.inner.borrow_mut();
@@ -80,12 +84,15 @@ impl InputHighlighter for TreeSitterInputHighlighter {
                 highlighter.update(edit, text, Some(SYNC_PARSE_TIMEOUT))
             }
         };
-        if completed {
+        self.syntax_current
+            .set(completed && (changed || was_current));
+        if self.syntax_current.get() {
             self.parse_task.borrow_mut().take();
             return;
         }
 
         let highlighter = self.inner.clone();
+        let syntax_current = self.syntax_current.clone();
         let parse_task = self.parse_task.clone();
         let language = highlighter.borrow().language().clone();
         let old_tree = highlighter.borrow().tree().cloned();
@@ -148,15 +155,32 @@ impl InputHighlighter for TreeSitterInputHighlighter {
                 .await;
 
             if let Some((tree, injections, folds)) = result {
-                highlighter
-                    .borrow_mut()
-                    .apply_background_tree(tree, &text_for_apply, injections);
+                if highlighter.borrow().text().eq(&text_for_apply) {
+                    highlighter.borrow_mut().apply_background_tree(
+                        tree,
+                        &text_for_apply,
+                        injections,
+                    );
+                    syntax_current.set(true);
+                }
                 let _ = entity.update(cx, |state, cx| {
                     state.apply_highlighter_fold_candidates(folds, cx);
                 });
             }
         });
         parse_task.borrow_mut().replace(task);
+    }
+
+    fn newline_indent(
+        &self,
+        text: &Rope,
+        selection: Range<usize>,
+        unit: &str,
+    ) -> Option<NewlineIndent> {
+        if !self.syntax_current.get() {
+            return None;
+        }
+        super::indentation::newline_indent(&self.inner.borrow(), text, selection, unit)
     }
 
     fn styles(
@@ -227,4 +251,70 @@ fn extract_fold_ranges_in_range(
     ranges.sort_by_key(|range| range.start_line);
     ranges.dedup_by_key(|range| range.start_line);
     ranges
+}
+
+#[cfg(all(test, feature = "tree-sitter-rust"))]
+mod tests {
+    use super::*;
+    use gpui::{AppContext, Context, Entity, IntoElement, Render, TestAppContext, Window, div};
+
+    struct Harness(Entity<EditorState>);
+    impl Render for Harness {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let _ = self.0.read(cx);
+            div()
+        }
+    }
+
+    #[gpui::test]
+    fn unchanged_text_keeps_parsing_until_syntax_is_current(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let adapter = Rc::new(RefCell::new(TreeSitterInputHighlighter::new("rust")));
+        let old = Rope::from("fn f() {}");
+        let text = Rope::from("fn f() {\n  if true {");
+        // Deterministically model a timed-out parse: the stored text advanced,
+        // but the tree and syntax-current flag still describe the previous text.
+        assert!(
+            adapter
+                .borrow_mut()
+                .inner
+                .borrow_mut()
+                .update(None, &old, None)
+        );
+        adapter.borrow_mut().inner.borrow_mut().edit_tree(
+            Some(InputEdit {
+                start_byte: old.len() - 1,
+                old_end_byte: old.len(),
+                new_end_byte: text.len(),
+                start_position: Point::new(0, old.len() - 1),
+                old_end_position: Point::new(0, old.len()),
+                new_end_position: Point::new(1, "  if true {".len()),
+            }),
+            &text,
+        );
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let state = cx.new(|cx| EditorState::new(window, cx));
+            state.update(cx, |_, cx| {
+                adapter.borrow_mut().update(None, &text, false, window, cx)
+            });
+            Harness(state)
+        });
+        assert!(adapter.borrow().parse_task.borrow().is_some());
+        assert!(
+            adapter
+                .borrow()
+                .newline_indent(&text, text.len()..text.len(), "  ")
+                .is_none()
+        );
+        cx.executor().advance_clock(Duration::from_millis(200));
+        cx.run_until_parked();
+        assert_eq!(
+            adapter
+                .borrow()
+                .newline_indent(&text, text.len()..text.len(), "  ")
+                .unwrap()
+                .indent(),
+            "    "
+        );
+    }
 }

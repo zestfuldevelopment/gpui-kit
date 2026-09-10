@@ -23,10 +23,41 @@ impl HighlightStyleResolver for NoHighlightStyles {
     }
 }
 
+/// Indentation for an Enter edit, in UTF-8 text rather than parser coordinates.
+/// A closing indent requests a second newline before an immediately following
+/// closer. Base keeps both lines and the body caret in one undo transaction.
+#[derive(Clone, Debug)]
+pub struct NewlineIndent {
+    indent: String,
+    closing_indent: Option<String>,
+}
+
+impl NewlineIndent {
+    pub fn new(indent: impl Into<String>) -> Self {
+        Self {
+            indent: indent.into(),
+            closing_indent: None,
+        }
+    }
+
+    pub fn with_closing_indent(mut self, indent: impl Into<String>) -> Self {
+        self.closing_indent = Some(indent.into());
+        self
+    }
+
+    pub fn indent(&self) -> &str {
+        &self.indent
+    }
+
+    pub fn closing_indent(&self) -> Option<&str> {
+        self.closing_indent.as_deref()
+    }
+}
+
 /// Parser-independent syntax highlighting seam consumed by the Base editor.
 ///
 /// Implementations own parsing, incremental state, and language-specific
-/// behavior. Base only asks for styled ranges and fold candidates.
+/// behavior. Base asks for styled ranges, fold candidates, and optional Enter indentation.
 pub trait InputHighlighter {
     fn language(&self) -> SharedString;
 
@@ -46,6 +77,19 @@ pub trait InputHighlighter {
         range: &Range<usize>,
         resolver: &dyn HighlightStyleResolver,
     ) -> Vec<(Range<usize>, HighlightStyle)>;
+
+    /// Suggest indentation at the start of a byte-based replacement range.
+    /// Return `None` for uncertain or stale syntax to inherit existing whitespace.
+    /// `unit` is the editor's configured indent; preserve existing hard tabs.
+    /// A closing indent may consume only horizontal whitespace after the range.
+    fn newline_indent(
+        &self,
+        _text: &Rope,
+        _selection: Range<usize>,
+        _unit: &str,
+    ) -> Option<NewlineIndent> {
+        None
+    }
 
     fn fold_ranges(&self, text: &Rope) -> Vec<FoldRange>;
 

@@ -77,7 +77,7 @@ pub use display_map::{BufferPoint, DisplayMap, DisplayPoint, FoldRange, Wrapping
 pub use editor::{Editor, EditorState};
 pub use highlighting::{
     DiagnosticColors, FoldIconRenderer, HighlightStyleResolver, InputEditorStyle, InputHighlighter,
-    InputHighlighterFactory, SharedHighlightStyleResolver,
+    InputHighlighterFactory, NewlineIndent, SharedHighlightStyleResolver,
 };
 pub use indent::TabSize;
 pub use input::{Input, InputState};
