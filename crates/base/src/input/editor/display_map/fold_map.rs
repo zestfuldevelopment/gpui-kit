@@ -112,33 +112,43 @@ impl FoldMap {
         candidates.dedup_by_key(|r| r.start_line);
         self.candidates = candidates;
 
-        // Remove any folded ranges that are no longer in candidates
-        self.folded.retain(|fold| {
-            self.candidates
-                .iter()
-                .any(|c| c.start_line == fold.start_line)
+        // Keep closed folds tied to the freshly parsed extent of their header.
+        // A surviving header can grow or shrink without changing its start line.
+        self.folded.retain_mut(|fold| {
+            match self
+                .candidates
+                .binary_search_by_key(&fold.start_line, |c| c.start_line)
+            {
+                Ok(index) => {
+                    *fold = self.candidates[index];
+                    true
+                }
+                Err(_) => false,
+            }
         });
+        self.needs_rebuild = true;
     }
 
     /// Merge new candidates extracted from an edited region into existing candidates.
     ///
     /// Replaces candidates within [edit_start_line, edit_end_line] with `new_candidates`,
-    /// keeping candidates outside the edit range intact.
+    /// keeping candidates outside the edit range unless their header was reparsed.
     pub(super) fn merge_candidates_for_edit(
         &mut self,
         edit_start_line: usize,
         edit_end_line: usize,
-        new_candidates: Vec<FoldRange>,
+        mut new_candidates: Vec<FoldRange>,
     ) {
         // Remove old candidates within the edit range (already done by adjust_folds_for_edit)
         // But do it again in case adjust wasn't called or range differs
         self.candidates
             .retain(|c| c.start_line < edit_start_line || c.start_line > edit_end_line);
 
-        // Add new candidates
-        self.candidates.extend(new_candidates);
-        self.candidates.sort_by_key(|r| r.start_line);
-        self.candidates.dedup_by_key(|r| r.start_line);
+        // Extraction includes enclosing nodes whose headers precede the edit.
+        // Put fresh ranges first so stable sorting/deduplication replaces the
+        // old extent for those headers rather than keeping a stale ancestor.
+        new_candidates.append(&mut self.candidates);
+        self.set_candidates(new_candidates);
     }
 
     /// Set a fold at the given start_line (must be in candidates)
@@ -339,5 +349,48 @@ impl FoldMap {
         }
 
         self.needs_rebuild = false;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refreshed_ancestor_replaces_its_older_shorter_candidate() {
+        let mut map = FoldMap::new();
+        map.set_candidates(vec![FoldRange::new(0, 2), FoldRange::new(8, 12)]);
+        map.set_folded(8, true);
+        map.adjust_folds_for_edit(3, 3, 0);
+        map.merge_candidates_for_edit(3, 3, vec![FoldRange::new(0, 3)]);
+        assert_eq!(
+            map.fold_candidates(),
+            &[FoldRange::new(0, 3), FoldRange::new(8, 12)]
+        );
+        assert_eq!(map.folded_ranges(), &[FoldRange::new(8, 12)]);
+    }
+
+    #[test]
+    fn full_refresh_updates_closed_fold_extent_and_discards_removed_folds() {
+        let mut map = FoldMap::new();
+        map.set_candidates(vec![FoldRange::new(0, 2), FoldRange::new(8, 12)]);
+        map.set_folded(0, true);
+        map.set_folded(8, true);
+        map.set_candidates(vec![FoldRange::new(0, 3)]);
+        assert_eq!(map.folded_ranges(), &[FoldRange::new(0, 3)]);
+    }
+
+    #[test]
+    fn incremental_refresh_updates_closed_ancestor_extent() {
+        let mut map = FoldMap::new();
+        map.set_candidates(vec![FoldRange::new(0, 2), FoldRange::new(8, 12)]);
+        map.set_folded(0, true);
+        map.set_folded(8, true);
+        map.adjust_folds_for_edit(3, 3, 0);
+        map.merge_candidates_for_edit(3, 3, vec![FoldRange::new(0, 3)]);
+        assert_eq!(
+            map.folded_ranges(),
+            &[FoldRange::new(0, 3), FoldRange::new(8, 12)]
+        );
     }
 }

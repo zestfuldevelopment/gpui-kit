@@ -194,8 +194,8 @@ impl DisplayMap {
 
     /// Incrementally update fold candidates after a text edit.
     ///
-    /// Extracts new fold candidates only within the edited byte range
-    /// and merges them with existing (already adjusted) candidates.
+    /// Extracts new fold candidates across the affected lines and merges them
+    /// with existing (already adjusted) candidates.
     pub fn update_fold_candidates_for_edit(
         &mut self,
         extract_fold_ranges: impl FnOnce(Range<usize>, &Rope) -> Vec<FoldRange>,
@@ -207,9 +207,15 @@ impl DisplayMap {
             .offset_to_point(edit_byte_range.end.min(new_text.len()))
             .row;
 
-        let new_candidates = extract_fold_ranges(edit_byte_range, new_text);
+        // Invalidation removes candidates intersecting whole lines. Refresh
+        // those same lines: inserted bytes alone miss a node ending just before
+        // a newline/space insertion, and a deletion can leave an empty range.
+        let affected_bytes = new_text.line_start_offset(new_start_line)
+            ..new_text.line_start_offset(new_end_line + 1);
+        let new_candidates = extract_fold_ranges(affected_bytes, new_text);
         self.fold_map
             .merge_candidates_for_edit(new_start_line, new_end_line, new_candidates);
+        self.rebuild_fold_projection();
     }
 
     /// Update text (incremental or full)
