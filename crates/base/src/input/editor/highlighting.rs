@@ -91,6 +91,14 @@ pub trait InputHighlighter {
         None
     }
 
+    /// Match a structural bracket adjacent to a UTF-8 byte caret offset.
+    /// The bracket after the caret takes precedence. Missing or uncertain
+    /// syntax returns `None`; this query must not synchronously parse text.
+    /// Returned ranges are ordered, non-overlapping, single bracket bytes.
+    fn matching_brackets(&self, _text: &Rope, _caret: usize) -> Option<[Range<usize>; 2]> {
+        None
+    }
+
     fn fold_ranges(&self, text: &Rope) -> Vec<FoldRange>;
 
     fn fold_ranges_for_edit(&self, range: Range<usize>, text: &Rope) -> Vec<FoldRange> {

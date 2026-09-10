@@ -5,12 +5,13 @@ use gpui_base::input::{NewlineIndent, RopeExt};
 use ropey::Rope;
 use tree_sitter::Node;
 
-use super::SyntaxHighlighter;
+use super::{
+    SyntaxHighlighter,
+    syntax_tokens::{Token, token_before},
+};
 
 // Limit copies and ancestry walks for pathological lines / deeply nested syntax.
 const MAX_LINE_BYTES: usize = 16 * 1024;
-const MAX_ANCESTORS: usize = 256;
-const MAX_CURSOR_STEPS: usize = 4096;
 
 pub(super) fn newline_indent(
     highlighter: &SyntaxHighlighter,
@@ -199,66 +200,6 @@ pub(super) fn newline_indent(
     None
 }
 
-/// Retain the path while seeking a token: Node::parent() re-searches from the
-/// root, so repeated ancestry queries can otherwise scan a large document.
-struct Token<'tree> {
-    path: Vec<Node<'tree>>,
-}
-
-impl<'tree> Token<'tree> {
-    fn node(&self) -> Node<'tree> {
-        *self.path.last().expect("a token includes the root")
-    }
-    fn parent(&self) -> Option<Node<'tree>> {
-        self.path.iter().rev().nth(1).copied()
-    }
-    fn parent_of(&self, node: Node<'tree>) -> Option<Node<'tree>> {
-        self.path
-            .windows(2)
-            .find(|pair| pair[1] == node)
-            .map(|pair| pair[0])
-    }
-    fn ancestor(&self, predicate: impl Fn(Node<'tree>) -> bool) -> Option<Node<'tree>> {
-        self.path
-            .iter()
-            .rev()
-            .copied()
-            .find(|node| predicate(*node))
-    }
-    fn is_code(&self) -> bool {
-        self.path.iter().all(|node| !protected(node.kind()))
-    }
-}
-
-fn token_before<'tree>(root: Node<'tree>, text: &Rope, end: usize) -> Option<Token<'tree>> {
-    let start = text.clip_offset(end.saturating_sub(1), sum_tree::Bias::Left);
-    let mut cursor = root.walk();
-    let mut path = Vec::new();
-    for step in 0..MAX_CURSOR_STEPS {
-        if step + 1 == MAX_CURSOR_STEPS {
-            return None;
-        }
-        let node = cursor.node();
-        if node.start_byte() <= start && node.end_byte() >= end {
-            path.push(node);
-            if path.len() > MAX_ANCESTORS {
-                return None;
-            }
-            if cursor.goto_first_child() {
-                continue;
-            }
-            break;
-        }
-        if node.start_byte() > start || !cursor.goto_next_sibling() {
-            break;
-        }
-    }
-    let token = Token { path };
-    let node = token.path.last()?;
-    (node.end_byte() <= end && node.end_byte() - node.start_byte() <= MAX_LINE_BYTES)
-        .then_some(token)
-}
-
 fn closer_is_code(root: Node<'_>, text: &Rope, start: usize) -> bool {
     let end = start
         + if text.char_at(start) == Some('<') {
@@ -271,23 +212,6 @@ fn closer_is_code(root: Node<'_>, text: &Rope, start: usize) -> bool {
 
 fn is_comment(kind: &str) -> bool {
     kind.contains("comment")
-}
-
-fn protected(kind: &str) -> bool {
-    is_comment(kind)
-        || kind.contains("string")
-        || matches!(
-            kind,
-            "char_literal"
-                | "character_literal"
-                | "regex"
-                | "regex_pattern"
-                | "heredoc_body"
-                | "raw_text"
-                | "jsx_text"
-                | "plain_scalar"
-                | "block_scalar"
-        )
 }
 
 fn python_suite(token: &Token<'_>) -> bool {

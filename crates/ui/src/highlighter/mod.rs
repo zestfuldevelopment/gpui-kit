@@ -7,9 +7,13 @@ mod diagnostic_styles;
 pub(crate) use diagnostic_styles::*;
 
 #[cfg(feature = "tree-sitter")]
+mod brackets;
+#[cfg(feature = "tree-sitter")]
 mod indentation;
 #[cfg(feature = "tree-sitter")]
 mod input_adapter;
+#[cfg(feature = "tree-sitter")]
+mod syntax_tokens;
 #[cfg(feature = "tree-sitter")]
 pub(crate) use input_adapter::input_highlighter_factory;
 

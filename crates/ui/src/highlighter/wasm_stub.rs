@@ -445,6 +445,18 @@ impl HighlightTheme {
 
 impl gpui_base::input::HighlightStyleResolver for HighlightTheme {
     fn style(&self, name: &str) -> Option<HighlightStyle> {
+        if name == "bracket.match" {
+            let foreground = self.style.editor_foreground?;
+            return Some(HighlightStyle {
+                background_color: Some(foreground.alpha(0.16)),
+                underline: Some(gpui::UnderlineStyle {
+                    thickness: gpui::px(1.),
+                    color: Some(foreground),
+                    wavy: false,
+                }),
+                ..Default::default()
+            });
+        }
         self.style.syntax.style(name)
     }
 }

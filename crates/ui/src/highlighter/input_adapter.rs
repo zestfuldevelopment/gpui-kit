@@ -183,6 +183,13 @@ impl InputHighlighter for TreeSitterInputHighlighter {
         super::indentation::newline_indent(&self.inner.borrow(), text, selection, unit)
     }
 
+    fn matching_brackets(&self, text: &Rope, caret: usize) -> Option<[Range<usize>; 2]> {
+        if !self.syntax_current.get() {
+            return None;
+        }
+        super::brackets::matching_brackets(&self.inner.borrow(), text, caret)
+    }
+
     fn styles(
         &self,
         range: &Range<usize>,
@@ -264,6 +271,36 @@ mod tests {
             let _ = self.0.read(cx);
             div()
         }
+    }
+
+    #[gpui::test]
+    fn bracket_matching_waits_for_current_background_syntax(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let adapter = Rc::new(RefCell::new(TreeSitterInputHighlighter::new("rust")));
+        let text = Rope::from("fn f() { call(alpha); }");
+        assert!(
+            adapter
+                .borrow_mut()
+                .inner
+                .borrow_mut()
+                .update(None, &text, None)
+        );
+        // A stored tree alone is insufficient while the adapter awaits freshness.
+        assert!(adapter.borrow().matching_brackets(&text, 13).is_none());
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let state = cx.new(|cx| EditorState::new(window, cx));
+            state.update(cx, |_, cx| {
+                adapter.borrow_mut().update(None, &text, false, window, cx)
+            });
+            Harness(state)
+        });
+        assert!(adapter.borrow().matching_brackets(&text, 13).is_none());
+        cx.executor().advance_clock(Duration::from_millis(200));
+        cx.run_until_parked();
+        assert_eq!(
+            adapter.borrow().matching_brackets(&text, 13),
+            Some([13..14, 19..20])
+        );
     }
 
     #[gpui::test]

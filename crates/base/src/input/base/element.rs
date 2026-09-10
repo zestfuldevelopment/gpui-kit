@@ -81,6 +81,43 @@ fn compose_decorations(
     Some(gpui::combine_highlights(styles, visible_decorations).collect())
 }
 
+// The input styles are already disjoint after ordinary highlight composition.
+// Preserve their properties when adding the transient caret marker.
+fn compose_bracket_matches(
+    styles: Vec<(Range<usize>, HighlightStyle)>,
+    pair: [Range<usize>; 2],
+    marker: HighlightStyle,
+) -> Vec<(Range<usize>, HighlightStyle)> {
+    // Default runs fill gaps without introducing competing style properties.
+    let mut styles: Vec<_> = gpui::combine_highlights(
+        styles,
+        pair.clone()
+            .into_iter()
+            .map(|range| (range, HighlightStyle::default())),
+    )
+    .collect();
+    for bracket in pair {
+        let mut result = Vec::with_capacity(styles.len() + 2);
+        for (range, style) in styles {
+            let start = range.start.max(bracket.start);
+            let end = range.end.min(bracket.end);
+            if start >= end {
+                result.push((range, style));
+                continue;
+            }
+            if range.start < start {
+                result.push((range.start..start, style));
+            }
+            result.push((start..end, marker.highlight(style)));
+            if end < range.end {
+                result.push((end..range.end, style));
+            }
+        }
+        styles = result;
+    }
+    styles
+}
+
 fn compose_decoration_collections<'a>(
     mut styles: Vec<(Range<usize>, HighlightStyle)>,
     collections: impl IntoIterator<Item = &'a [TextDecoration]>,
@@ -1416,6 +1453,7 @@ impl<M: InputModeKind> TextElement<M> {
         visible_buffer_lines: &[usize],
         _visible_top: Pixels,
         visible_byte_range: Range<usize>,
+        focused: bool,
         cx: &mut App,
     ) -> Option<Vec<(Range<usize>, HighlightStyle)>> {
         let state = self.state.read(cx);
@@ -1551,6 +1589,19 @@ impl<M: InputModeKind> TextElement<M> {
             .unwrap_or_default();
         }
         styles = gpui::combine_highlights(diagnostic_styles, styles).collect();
+
+        // Matching brackets add a transient decoration without changing syntax
+        // foreground/font metrics or entering the edit/history pipeline.
+        if focused
+            && !state.disabled
+            && !state.masked
+            && state.selected_range.is_empty()
+            && state.ime_marked_range.is_none()
+            && let Some(pair) = highlighter.matching_brackets(text, state.cursor())
+            && let Some(style) = state.editor_style.highlight_styles.style("bracket.match")
+        {
+            styles = compose_bracket_matches(styles, pair, style);
+        }
 
         // Some sources reach outside the flushed groups — a diagnostic
         // straddling the viewport edge, or any range inside a folded region —
@@ -1771,6 +1822,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
             &visible_buffer_lines,
             visible_top,
             visible_start_offset..visible_end_offset,
+            state.focus_handle.is_focused(window) && window.is_window_active(),
             cx,
         );
 
@@ -2648,6 +2700,60 @@ fn split_runs_by_bg_segments(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bracket_marker_preserves_existing_styles_at_every_run_position() {
+        let marker = HighlightStyle {
+            background_color: Some(gpui::white().alpha(0.16)),
+            underline: Some(UnderlineStyle {
+                thickness: px(1.),
+                color: Some(gpui::white()),
+                wavy: false,
+            }),
+            ..Default::default()
+        };
+        let diagnostic = HighlightStyle {
+            color: Some(gpui::blue()),
+            underline: Some(UnderlineStyle {
+                thickness: px(1.),
+                color: Some(gpui::red()),
+                wavy: true,
+            }),
+            ..Default::default()
+        };
+        for count in 1..20 {
+            let syntax = (0..count)
+                .map(|i| (i * 10..i * 10 + 10, diagnostic))
+                .collect();
+            let offset = (count - 1) * 10;
+            let result = compose_bracket_matches(
+                syntax,
+                [offset..offset + 1, offset + 5..offset + 6],
+                marker,
+            );
+            let style = result
+                .iter()
+                .find(|(range, _)| range.start == offset)
+                .unwrap()
+                .1;
+            assert_eq!(
+                style.underline, diagnostic.underline,
+                "run {count}: keep diagnostic squiggle"
+            );
+            assert_eq!(style.color, diagnostic.color);
+            assert_eq!(style.background_color, marker.background_color);
+        }
+        let application = HighlightStyle {
+            background_color: Some(gpui::red()),
+            ..diagnostic
+        };
+        let result = compose_bracket_matches(vec![(0..10, application)], [2..3, 7..8], marker);
+        assert!(
+            result
+                .iter()
+                .all(|(_, style)| style.background_color == application.background_color)
+        );
+    }
 
     #[test]
     fn test_plain_text_decorations_include_unstyled_gaps() {
