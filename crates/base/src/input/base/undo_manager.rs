@@ -85,6 +85,25 @@ impl UndoManager {
         }
     }
 
+    /// Record the final selection of a completed, nonempty atomic replacement.
+    pub(super) fn set_last_selection_after(
+        &mut self,
+        selection: crate::input::Selection,
+        reversed: bool,
+    ) {
+        if self.ignoring {
+            return;
+        }
+        if let Some(change) = self
+            .undo_transactions
+            .last_mut()
+            .and_then(|t| t.changes.last_mut())
+        {
+            change.selection_after = selection;
+            change.selection_after_reversed = reversed;
+        }
+    }
+
     pub(super) fn begin_transaction(&mut self) {
         if self.transaction_open {
             return;

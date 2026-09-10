@@ -18,6 +18,8 @@ mod base;
 pub(crate) mod blink_cursor;
 #[path = "base/change.rs"]
 mod change;
+#[path = "editor/comment.rs"]
+mod comment;
 #[path = "base/cursor.rs"]
 mod cursor;
 #[path = "editor/decorations.rs"]
@@ -67,6 +69,7 @@ pub(crate) fn init(cx: &mut App) {
 
 pub use crate::number_input::{NumberInputEvent, NumberStep};
 pub use base::{InputBase, InputContextMenuCapabilities, InputStyles};
+pub use comment::CommentSyntax;
 pub use cursor::Selection;
 pub use decorations::{TextDecoration, TextDecorationCollection};
 pub use diagnostics::{

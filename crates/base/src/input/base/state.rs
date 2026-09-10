@@ -73,6 +73,7 @@ actions!(
         DeleteToPreviousWordStart,
         DeleteToNextWordEnd,
         Indent,
+        ToggleComment,
         Outdent,
         IndentInline,
         OutdentInline,
@@ -172,6 +173,10 @@ pub(crate) fn init(cx: &mut App) {
         KeyBinding::new("right", MoveRight, Some(CONTEXT)),
         KeyBinding::new("pageup", MovePageUp, Some(CONTEXT)),
         KeyBinding::new("pagedown", MovePageDown, Some(CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-/", ToggleComment, Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-/", ToggleComment, Some(CONTEXT)),
         KeyBinding::new("tab", IndentInline, Some(CONTEXT)),
         KeyBinding::new("shift-tab", OutdentInline, Some(CONTEXT)),
         #[cfg(target_os = "macos")]

@@ -9,6 +9,8 @@ pub(crate) use diagnostic_styles::*;
 #[cfg(feature = "tree-sitter")]
 mod brackets;
 #[cfg(feature = "tree-sitter")]
+mod comments;
+#[cfg(feature = "tree-sitter")]
 mod indentation;
 #[cfg(feature = "tree-sitter")]
 mod input_adapter;

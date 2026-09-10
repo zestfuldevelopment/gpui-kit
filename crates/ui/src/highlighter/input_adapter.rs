@@ -183,6 +183,14 @@ impl InputHighlighter for TreeSitterInputHighlighter {
         super::indentation::newline_indent(&self.inner.borrow(), text, selection, unit)
     }
 
+    fn comment_syntax(
+        &self,
+        _text: &Rope,
+        range: Range<usize>,
+    ) -> Option<gpui_base::input::CommentSyntax> {
+        super::comments::syntax(&self.inner.borrow(), self.syntax_current.get(), range)
+    }
+
     fn matching_brackets(&self, text: &Rope, caret: usize) -> Option<[Range<usize>; 2]> {
         if !self.syntax_current.get() {
             return None;

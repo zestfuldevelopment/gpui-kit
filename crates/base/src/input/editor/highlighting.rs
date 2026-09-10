@@ -61,6 +61,12 @@ impl NewlineIndent {
 pub trait InputHighlighter {
     fn language(&self) -> SharedString;
 
+    /// Comment syntax for a span of whole buffer lines, or None if unsupported.
+    /// Providers may reject mixed/stale syntax; this must not synchronously parse.
+    fn comment_syntax(&self, _text: &Rope, _range: Range<usize>) -> Option<super::CommentSyntax> {
+        None
+    }
+
     fn update(
         &mut self,
         edit: Option<InputEdit>,
