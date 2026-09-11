@@ -28,10 +28,10 @@ fn mouse_line_drag_keeps_blank_lines_crlf_and_eof(cx: &mut TestAppContext) {
         view.input.update(cx, |state, cx| {
             state.set_value("one\r\n\r\ntwo\r\n", window, cx);
             state.select_line(8, window, cx);
-            // Preserve the existing logical-line convention: LF is excluded,
-            // while its preceding CR is part of line_range.
-            assert_eq!(state.selected_range(), 7..11);
-            for (offset, expected) in [(5, 5..11), (1, 0..11), (8, 7..11), (12, 7..12)] {
+            // Line selection excludes the entire ending, so replacement cannot
+            // remove CR while leaving LF behind. Interior full lines retain both.
+            assert_eq!(state.selected_range(), 7..10);
+            for (offset, expected) in [(5, 5..10), (1, 0..10), (8, 7..10), (12, 7..12)] {
                 state.select_by_mouse(offset, false, cx);
                 assert_eq!(state.selected_range(), expected);
             }

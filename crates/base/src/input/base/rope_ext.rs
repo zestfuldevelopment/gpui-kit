@@ -3,6 +3,18 @@ use std::ops::Range;
 use ropey::{LineType, Rope, RopeSlice};
 use sum_tree::Bias;
 
+/// A visual caret or line-selection endpoint cannot split a CRLF pair.
+/// Keep the LF-based rope/parser line offsets unchanged; only input positions
+/// snap to the visible end of the preceding line.
+pub(super) fn clip_crlf_offset(text: &Rope, offset: usize) -> usize {
+    let offset = offset.min(text.len());
+    if offset > 0 && text.char_at(offset) == Some('\n') && text.char_at(offset - 1) == Some('\r') {
+        offset - 1
+    } else {
+        offset
+    }
+}
+
 /// Parser-independent byte/row/column position used for incremental edits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Point {

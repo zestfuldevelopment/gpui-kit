@@ -1238,7 +1238,12 @@ impl<M: InputModeKind> InputBaseState<M> {
         }
         self.undo_manager.break_transaction_coalescing();
         let offset = (self.end_of_line() + 1).min(self.text.len());
-        self.select_to(self.next_boundary(offset), cx);
+        let mut offset = self.next_boundary(offset);
+        // Forward selection across a blank CRLF line includes the whole break.
+        if super::rope_ext::clip_crlf_offset(&self.text, offset) < offset {
+            offset += 1;
+        }
+        self.select_to(offset, cx);
     }
 
     pub(super) fn on_action_select_all(
@@ -1289,7 +1294,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         cx: &mut Context<Self>,
     ) {
         self.undo_manager.break_transaction_coalescing();
-        let offset = self.end_of_line();
+        let offset = super::rope_ext::clip_crlf_offset(&self.text, self.end_of_line());
         // Mirrors MoveEnd: the caret belongs at the end of the visual row it is on.
         self.select_to_with_affinity(offset, true, cx);
     }
@@ -1516,12 +1521,13 @@ impl<M: InputModeKind> InputBaseState<M> {
             return;
         }
 
+        let cursor = super::rope_ext::clip_crlf_offset(&self.text, self.cursor());
         let mut offset = self.start_of_line();
-        if offset == self.cursor() {
-            offset = offset.saturating_sub(1);
+        if offset == cursor {
+            offset = crate::input::grapheme::previous(&self.text, offset);
         }
         self.replace_text_in_range_silent(
-            Some(self.range_to_utf16(&(offset..self.cursor()))),
+            Some(self.range_to_utf16(&(offset..cursor))),
             "",
             window,
             cx,
@@ -1541,12 +1547,13 @@ impl<M: InputModeKind> InputBaseState<M> {
             return;
         }
 
-        let mut offset = self.end_of_line();
-        if offset == self.cursor() {
-            offset = (offset + 1).clamp(0, self.text.len());
+        let cursor = super::rope_ext::clip_crlf_offset(&self.text, self.cursor());
+        let mut offset = super::rope_ext::clip_crlf_offset(&self.text, self.end_of_line());
+        if offset == cursor {
+            offset = crate::input::grapheme::next(&self.text, offset);
         }
         self.replace_text_in_range_silent(
-            Some(self.range_to_utf16(&(self.cursor()..offset))),
+            Some(self.range_to_utf16(&(cursor..offset))),
             "",
             window,
             cx,
@@ -1616,6 +1623,12 @@ impl<M: InputModeKind> InputBaseState<M> {
 
         if insert_newline {
             let mut replacement: Range<usize> = self.selected_range.into();
+            if replacement.is_empty() {
+                // Explicit byte selections and a paste can leave a caret inside
+                // CRLF; normalize this edit without changing their API/history.
+                let offset = super::rope_ext::clip_crlf_offset(&self.text, replacement.start);
+                replacement = offset..offset;
+            }
             let language_indent = if self.is_editable() && self.ime_marked_range.is_none() {
                 self.mode.highlighter().and_then(|highlighter| {
                     highlighter.borrow().as_ref().and_then(|highlighter| {
@@ -1675,7 +1688,12 @@ impl<M: InputModeKind> InputBaseState<M> {
                 self.move_to(caret, None, cx);
             } else {
                 let new_line_text = format!("{line_break}{indent}");
-                self.replace_text_in_range_silent(None, &new_line_text, window, cx);
+                // A marked IME range still owns replacement ahead of its caret.
+                let range_utf16 = self
+                    .ime_marked_range
+                    .is_none()
+                    .then(|| self.range_to_utf16(&replacement));
+                self.replace_text_in_range_silent(range_utf16, &new_line_text, window, cx);
             }
             self.pause_blink_cursor(cx);
         } else {
@@ -2296,11 +2314,12 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// Map a display byte index back to a text offset, undoing the mask expansion when the input
     /// is masked.
     fn resolve_index(&self, index: usize) -> usize {
-        if self.masked {
+        let offset = if self.masked {
             self.text.char_index_to_offset(index / MASK_CHAR.len_utf8())
         } else {
-            index.min(self.text.len())
-        }
+            index
+        };
+        super::rope_ext::clip_crlf_offset(&self.text, offset)
     }
 
     /// Returns a y offsetted point for the line origin.

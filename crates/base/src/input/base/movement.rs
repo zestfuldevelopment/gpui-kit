@@ -159,6 +159,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         } else {
             MoveDirection::Down
         };
+        let new_offset = super::rope_ext::clip_crlf_offset(&self.text, new_offset);
         self.move_to_with_affinity(new_offset, Some(direction), new_affinity, cx);
         // Set back the preferred_column
         self.preferred_column = was_preferred_column;
@@ -275,7 +276,7 @@ impl<M: InputModeKind> InputBaseState<M> {
 
     pub(super) fn end(&mut self, _: &MoveEnd, _: &mut Window, cx: &mut Context<Self>) {
         self.pause_blink_cursor(cx);
-        let offset = self.end_of_line();
+        let offset = super::rope_ext::clip_crlf_offset(&self.text, self.end_of_line());
         self.move_to_with_affinity(offset, Some(MoveDirection::Down), true, cx);
     }
 

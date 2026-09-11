@@ -100,7 +100,7 @@ impl TextSelector {
         let offset = text.clip_offset(offset, Bias::Left);
         let row = text.offset_to_point(offset).row;
         let start = text.line_start_offset(row);
-        let end = text.line_end_offset(row);
+        let end = super::rope_ext::clip_crlf_offset(text, text.line_end_offset(row));
 
         start..end
     }
@@ -111,10 +111,16 @@ impl TextSelector {
     ///
     /// Returns the start and end offsets of the selected word.
     pub(crate) fn word_range(text: &Rope, offset: usize) -> Option<Range<usize>> {
-        let offset = text.clip_offset(offset, Bias::Left);
+        let offset = super::rope_ext::clip_crlf_offset(text, text.clip_offset(offset, Bias::Left));
         let Some(char) = text.char_at(offset) else {
             return None;
         };
+
+        // A double-click on either half of a line break selects the whole
+        // pair, so the initial anchor and subsequent word drag stay valid.
+        if char == '\r' && text.char_at(offset + 1) == Some('\n') {
+            return Some(offset..offset + 2);
+        }
 
         let end = offset + char.len_utf8();
         let prev_chars = text.chars_at(offset).reversed().take(128);
