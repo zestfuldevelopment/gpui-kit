@@ -2749,6 +2749,198 @@ impl<M: InputModeKind> InputBaseState<M> {
         ))
     }
 
+    /// Apply the normal edit pipeline and report whether validation accepted it.
+    fn apply_text_replacement(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let mut requested_intent = self.undo_manager.pending_intent.take();
+        if !self.is_editable() {
+            return false;
+        }
+        // A text edit invalidates the gesture's original word/line offsets.
+        self.stop_mouse_selection();
+        let selection_before = self.selected_range;
+
+        if self.blink_cursor.read(cx).visible() {
+            self.pause_blink_cursor(cx);
+        }
+
+        // NOTE: The normalization keeps the UTF-16 length, but may change the
+        // UTF-8 byte length, so all the byte-offset calculations below must
+        // use the normalized text.
+        let mut new_text = self.normalize_input(new_text);
+
+        let mut range = range_utf16
+            .as_ref()
+            .map(|range_utf16| self.range_from_utf16(range_utf16))
+            .or(self.ime_marked_range.map(|range| {
+                let range = self.range_to_utf16(&(range.start..range.end));
+                self.range_from_utf16(&range)
+            }))
+            .unwrap_or(self.selected_range.into());
+
+        // Only direct character typing may dedent. Paste, commands, explicit
+        // replacements and IME retain their exact replacement semantics.
+        if new_text == "}"
+            && requested_intent.is_none()
+            && !self.silent_replace_text
+            && range_utf16.is_none()
+            && self.ime_marked_range.is_none()
+            && range.is_empty()
+            && self.is_code_editor()
+        {
+            let row = self.text.offset_to_point(range.start).row;
+            let start = self.text.line_start_offset(row);
+            let end = super::rope_ext::clip_crlf_offset(&self.text, self.text.line_end_offset(row));
+            if range.start <= end
+                && range.start - start <= 16 * 1024
+                && end.saturating_sub(range.start) <= 16 * 1024
+                && self
+                    .text
+                    .slice(start..end)
+                    .chars()
+                    .all(|c| matches!(c, ' ' | '\t'))
+            {
+                let indent = self.mode.highlighter().and_then(|highlighter| {
+                    highlighter.borrow().as_ref().and_then(|highlighter| {
+                        highlighter.closing_brace_indent(&self.text, range.start)
+                    })
+                });
+                if let Some(indent) = indent.filter(|indent| {
+                    indent.len() < range.start - start
+                        && indent.chars().all(|c| matches!(c, ' ' | '\t'))
+                        && self
+                            .text
+                            .slice(start..start + indent.len())
+                            .chars()
+                            .eq(indent.chars())
+                }) {
+                    range.start = start;
+                    new_text = Cow::Owned(format!("{indent}}}"));
+                    requested_intent = Some(EditIntent::Atomic);
+                }
+            }
+        }
+        let new_text: &str = &new_text;
+
+        let old_text = self.text.clone();
+        self.text.replace(range.clone(), new_text);
+
+        let mut new_offset = (range.start + new_text.len()).min(self.text.len());
+
+        // True if the mask has changed the text, e.g. regrouping the
+        // separators or completing a leading dot.
+        let mut mask_changed = false;
+
+        if self.is_single_line() {
+            let pending_text = self.text.to_string();
+            // Check if the new text is valid.
+            //
+            // Only reject the edit if the old text was valid, to avoid
+            // trapping a pre-existing invalid text (e.g. a `default_value`
+            // that does not conform), the user can still edit to fix it.
+            if !self.is_valid_input(&pending_text, cx)
+                && self.is_valid_input(&old_text.to_string(), cx)
+            {
+                self.text = old_text;
+                return false;
+            }
+
+            if !self.mask_pattern.is_none() {
+                let mask_text = self.mask_pattern.mask(&pending_text);
+                mask_changed = mask_text.as_str() != pending_text;
+                self.text = Rope::from(mask_text.as_str());
+                let new_text_len =
+                    (new_text.len() + mask_text.len()).saturating_sub(pending_text.len());
+                new_offset = (range.start + new_text_len).min(mask_text.len());
+            }
+        }
+
+        if mask_changed {
+            // Masking rewrites the whole document, so ranges recorded against
+            // the old text no longer point at anything.
+            M::reset_annotations(self);
+        } else {
+            M::adjust_annotations(self, &range, new_text.len());
+        }
+        if mask_changed {
+            // A segment-based history entry no longer matches the masked
+            // document, record a whole-document change instead, so that
+            // undo/redo can restore the text exactly.
+            self.push_history(
+                &old_text,
+                &(0..old_text.len()),
+                &self.text.to_string(),
+                Some(EditIntent::Atomic),
+                selection_before,
+                Some(Selection::new(new_offset, new_offset)),
+            );
+        } else {
+            self.push_history(
+                &old_text,
+                &range,
+                &new_text,
+                requested_intent,
+                selection_before,
+                None,
+            );
+        }
+        // A commit ends the IME composition: macOS delivers `insertText:` for
+        // the confirmed candidate without a following `unmarkText`, so close
+        // the transaction here. Leaving it open would keep merging every later
+        // edit into the same change, which then carries the text and selection
+        // of the first composition.
+        self.undo_manager.commit_transaction();
+        // Fold and annotation coordinates must track every localized edit,
+        // even when display/parsing and observers see only the finished batch.
+        self.display_map
+            .adjust_folds_for_edit(&old_text, &range, new_text);
+        if self.undo_manager.is_atomic_batch() {
+            self.selected_range = (new_offset..new_offset).into();
+            self.ime_marked_range.take();
+            return true;
+        }
+        if let Some(diagnostics) = self.mode.diagnostics_mut() {
+            diagnostics.reset(&self.text)
+        }
+        self.display_map
+            .on_text_changed(&self.text, &range, &Rope::from(new_text), cx);
+
+        self.mode.update_highlighter::<M>(
+            super::mode::HighlighterUpdate {
+                selected_range: &range,
+                old_text: &old_text,
+                new_text: &self.text,
+                change_text: &new_text,
+                force: true,
+            },
+            window,
+            cx,
+        );
+
+        self.update_fold_candidates_incremental(&range, new_text);
+        M::refresh_language_features(self, window, cx);
+        self.selected_range = (new_offset..new_offset).into();
+        self.ime_marked_range.take();
+        self.update_preferred_column();
+        self.update_search(cx);
+        if self.is_multi_line() {
+            self.mode.update_auto_grow(&self.display_map);
+        }
+        if !self.silent_replace_text {
+            M::on_text_typed(self, &range, &new_text, window, cx);
+        }
+        if self.emit_events {
+            cx.emit(InputEvent::Change);
+        }
+        cx.notify();
+        true
+    }
+
     /// Replace text in range in silent.
     ///
     /// This will not trigger any UI interaction, such as auto-completion.
@@ -2758,10 +2950,11 @@ impl<M: InputModeKind> InputBaseState<M> {
         new_text: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         self.silent_replace_text = true;
-        self.replace_text_in_range(range_utf16, new_text, window, cx);
+        let accepted = self.apply_text_replacement(range_utf16, new_text, window, cx);
         self.silent_replace_text = false;
+        accepted
     }
 
     /// Publish a completed batch after each edit has adjusted folds and history.
@@ -2903,187 +3096,7 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let mut requested_intent = self.undo_manager.pending_intent.take();
-        if !self.is_editable() {
-            return;
-        }
-        // A text edit invalidates the gesture's original word/line offsets.
-        self.stop_mouse_selection();
-        let selection_before = self.selected_range;
-
-        if self.blink_cursor.read(cx).visible() {
-            self.pause_blink_cursor(cx);
-        }
-
-        // NOTE: The normalization keeps the UTF-16 length, but may change the
-        // UTF-8 byte length, so all the byte-offset calculations below must
-        // use the normalized text.
-        let mut new_text = self.normalize_input(new_text);
-
-        let mut range = range_utf16
-            .as_ref()
-            .map(|range_utf16| self.range_from_utf16(range_utf16))
-            .or(self.ime_marked_range.map(|range| {
-                let range = self.range_to_utf16(&(range.start..range.end));
-                self.range_from_utf16(&range)
-            }))
-            .unwrap_or(self.selected_range.into());
-
-        // Only direct character typing may dedent. Paste, commands, explicit
-        // replacements and IME retain their exact replacement semantics.
-        if new_text == "}"
-            && requested_intent.is_none()
-            && !self.silent_replace_text
-            && range_utf16.is_none()
-            && self.ime_marked_range.is_none()
-            && range.is_empty()
-            && self.is_code_editor()
-        {
-            let row = self.text.offset_to_point(range.start).row;
-            let start = self.text.line_start_offset(row);
-            let end = super::rope_ext::clip_crlf_offset(&self.text, self.text.line_end_offset(row));
-            if range.start <= end
-                && range.start - start <= 16 * 1024
-                && end.saturating_sub(range.start) <= 16 * 1024
-                && self
-                    .text
-                    .slice(start..end)
-                    .chars()
-                    .all(|c| matches!(c, ' ' | '\t'))
-            {
-                let indent = self.mode.highlighter().and_then(|highlighter| {
-                    highlighter.borrow().as_ref().and_then(|highlighter| {
-                        highlighter.closing_brace_indent(&self.text, range.start)
-                    })
-                });
-                if let Some(indent) = indent.filter(|indent| {
-                    indent.len() < range.start - start
-                        && indent.chars().all(|c| matches!(c, ' ' | '\t'))
-                        && self
-                            .text
-                            .slice(start..start + indent.len())
-                            .chars()
-                            .eq(indent.chars())
-                }) {
-                    range.start = start;
-                    new_text = Cow::Owned(format!("{indent}}}"));
-                    requested_intent = Some(EditIntent::Atomic);
-                }
-            }
-        }
-        let new_text: &str = &new_text;
-
-        let old_text = self.text.clone();
-        self.text.replace(range.clone(), new_text);
-
-        let mut new_offset = (range.start + new_text.len()).min(self.text.len());
-
-        // True if the mask has changed the text, e.g. regrouping the
-        // separators or completing a leading dot.
-        let mut mask_changed = false;
-
-        if self.is_single_line() {
-            let pending_text = self.text.to_string();
-            // Check if the new text is valid.
-            //
-            // Only reject the edit if the old text was valid, to avoid
-            // trapping a pre-existing invalid text (e.g. a `default_value`
-            // that does not conform), the user can still edit to fix it.
-            if !self.is_valid_input(&pending_text, cx)
-                && self.is_valid_input(&old_text.to_string(), cx)
-            {
-                self.text = old_text;
-                return;
-            }
-
-            if !self.mask_pattern.is_none() {
-                let mask_text = self.mask_pattern.mask(&pending_text);
-                mask_changed = mask_text.as_str() != pending_text;
-                self.text = Rope::from(mask_text.as_str());
-                let new_text_len =
-                    (new_text.len() + mask_text.len()).saturating_sub(pending_text.len());
-                new_offset = (range.start + new_text_len).min(mask_text.len());
-            }
-        }
-
-        if mask_changed {
-            // Masking rewrites the whole document, so ranges recorded against
-            // the old text no longer point at anything.
-            M::reset_annotations(self);
-        } else {
-            M::adjust_annotations(self, &range, new_text.len());
-        }
-        if mask_changed {
-            // A segment-based history entry no longer matches the masked
-            // document, record a whole-document change instead, so that
-            // undo/redo can restore the text exactly.
-            self.push_history(
-                &old_text,
-                &(0..old_text.len()),
-                &self.text.to_string(),
-                Some(EditIntent::Atomic),
-                selection_before,
-                Some(Selection::new(new_offset, new_offset)),
-            );
-        } else {
-            self.push_history(
-                &old_text,
-                &range,
-                &new_text,
-                requested_intent,
-                selection_before,
-                None,
-            );
-        }
-        // A commit ends the IME composition: macOS delivers `insertText:` for
-        // the confirmed candidate without a following `unmarkText`, so close
-        // the transaction here. Leaving it open would keep merging every later
-        // edit into the same change, which then carries the text and selection
-        // of the first composition.
-        self.undo_manager.commit_transaction();
-        // Fold and annotation coordinates must track every localized edit,
-        // even when display/parsing and observers see only the finished batch.
-        self.display_map
-            .adjust_folds_for_edit(&old_text, &range, new_text);
-        if self.undo_manager.is_atomic_batch() {
-            self.selected_range = (new_offset..new_offset).into();
-            self.ime_marked_range.take();
-            return;
-        }
-        if let Some(diagnostics) = self.mode.diagnostics_mut() {
-            diagnostics.reset(&self.text)
-        }
-        self.display_map
-            .on_text_changed(&self.text, &range, &Rope::from(new_text), cx);
-
-        self.mode.update_highlighter::<M>(
-            super::mode::HighlighterUpdate {
-                selected_range: &range,
-                old_text: &old_text,
-                new_text: &self.text,
-                change_text: &new_text,
-                force: true,
-            },
-            window,
-            cx,
-        );
-
-        self.update_fold_candidates_incremental(&range, new_text);
-        M::refresh_language_features(self, window, cx);
-        self.selected_range = (new_offset..new_offset).into();
-        self.ime_marked_range.take();
-        self.update_preferred_column();
-        self.update_search(cx);
-        if self.is_multi_line() {
-            self.mode.update_auto_grow(&self.display_map);
-        }
-        if !self.silent_replace_text {
-            M::on_text_typed(self, &range, &new_text, window, cx);
-        }
-        if self.emit_events {
-            cx.emit(InputEvent::Change);
-        }
-        cx.notify();
+        self.apply_text_replacement(range_utf16, new_text, window, cx);
     }
 
     /// Mark text is the IME temporary insert on typing.
@@ -5495,6 +5508,82 @@ mod tests {
                     assert_eq!(state.search_session.replace_mode, replace_mode);
                 }
                 assert_eq!(state.search_session.focus_revision, revision + 3);
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn search_replace_all_masks_completed_single_line_once(cx: &mut TestAppContext) {
+        let view = InputView::build(cx, |state| {
+            state
+                .mask_pattern(MaskPattern::Number {
+                    separator: Some(','),
+                    fraction: None,
+                })
+                .default_value("1,111")
+        });
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        cx.update(|window, cx| {
+            view.input.update(cx, |state, cx| {
+                state.set_selected_range(0..5, cx);
+                state.selection_reversed = true;
+                state.set_search_query("1", false, cx);
+                assert_eq!(state.replace_all_search_matches("", window, cx), 4);
+                assert_eq!(state.value(), "");
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.value(), "1,111");
+                assert_eq!(state.selected_range(), 0..5);
+                assert!(state.selection_reversed);
+                state.redo(&Redo, window, cx);
+                assert_eq!(state.value(), "");
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn search_replace_all_rejects_invalid_completed_single_line(cx: &mut TestAppContext) {
+        let view = InputView::build(cx, |state| {
+            state
+                .default_value("aa")
+                .validate(|text, _| text.chars().filter(|ch| *ch == 'b').count() <= 1)
+        });
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        cx.update(|window, cx| {
+            view.input.update(cx, |state, cx| {
+                state.set_selected_range(0..2, cx);
+                state.selection_reversed = true;
+                state.set_search_query("a", false, cx);
+                assert_eq!(state.replace_all_search_matches("b", window, cx), 0);
+                assert_eq!(state.value(), "aa");
+                assert_eq!(state.selected_range(), 0..2);
+                assert!(state.selection_reversed);
+                assert!(!state.undo_manager.has_undos());
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn search_replace_all_accepts_valid_completed_single_line(cx: &mut TestAppContext) {
+        let validations = Rc::new(Cell::new(0));
+        let sink = validations.clone();
+        let view = InputView::build(cx, move |state| {
+            state.default_value("aa").validate(move |text, _| {
+                sink.set(sink.get() + 1);
+                matches!(text, "aa" | "bb")
+            })
+        });
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        cx.update(|window, cx| {
+            view.input.update(cx, |state, cx| {
+                state.set_search_query("a", false, cx);
+                validations.set(0);
+                assert_eq!(state.replace_all_search_matches("b", window, cx), 2);
+                assert_eq!(state.value(), "bb");
+                assert_eq!(validations.get(), 1);
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.value(), "aa");
+                state.redo(&Redo, window, cx);
+                assert_eq!(state.value(), "bb");
             })
         });
     }

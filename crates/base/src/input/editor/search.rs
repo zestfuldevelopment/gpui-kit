@@ -286,6 +286,23 @@ impl<M: InputModeKind> InputBaseState<M> {
         }
         self.set_search_replacement(replacement, cx);
         let old_text = self.text.clone();
+        if self.is_single_line() {
+            // Validators and masks apply to the completed value. Intermediate
+            // values may be invalid, and remasking may invalidate saved offsets.
+            let mut completed = old_text.clone();
+            for range in ranges.iter().rev() {
+                completed.replace(range.clone(), replacement);
+            }
+            self.undo_manager.pending_intent = Some(crate::input::undo_manager::EditIntent::Atomic);
+            let range_utf16 = self.range_to_utf16(&(0..old_text.len()));
+            let accepted = self.replace_text_in_range_silent(
+                Some(range_utf16),
+                &completed.to_string(),
+                window,
+                cx,
+            );
+            return if accepted { ranges.len() } else { 0 };
+        }
         self.undo_manager.begin_atomic_batch();
         // Reverse order keeps each saved byte range valid. Each edit uses the
         // normal UTF-16 input/history path and adjusts only overlapping folds.
