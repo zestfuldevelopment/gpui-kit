@@ -183,6 +183,13 @@ impl InputHighlighter for TreeSitterInputHighlighter {
         super::indentation::newline_indent(&self.inner.borrow(), text, selection, unit)
     }
 
+    fn closing_brace_indent(&self, text: &Rope, caret: usize) -> Option<String> {
+        if !self.syntax_current.get() {
+            return None;
+        }
+        super::indentation::closing_brace_indent(&self.inner.borrow(), text, caret)
+    }
+
     fn comment_syntax(
         &self,
         _text: &Rope,
@@ -308,6 +315,39 @@ mod tests {
         assert_eq!(
             adapter.borrow().matching_brackets(&text, 13),
             Some([13..14, 19..20])
+        );
+    }
+
+    #[gpui::test]
+    fn typed_closer_waits_for_pending_syntax(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let adapter = Rc::new(RefCell::new(TreeSitterInputHighlighter::new("rust")));
+        let text = Rope::from("fn f() {\n  ");
+        assert!(
+            adapter
+                .borrow_mut()
+                .inner
+                .borrow_mut()
+                .update(None, &text, None)
+        );
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let state = cx.new(|cx| EditorState::new(window, cx));
+            state.update(cx, |_, cx| {
+                adapter.borrow_mut().update(None, &text, false, window, cx)
+            });
+            Harness(state)
+        });
+        assert!(
+            adapter
+                .borrow()
+                .closing_brace_indent(&text, text.len())
+                .is_none()
+        );
+        cx.executor().advance_clock(Duration::from_millis(200));
+        cx.run_until_parked();
+        assert_eq!(
+            adapter.borrow().closing_brace_indent(&text, text.len()),
+            Some(String::new())
         );
     }
 

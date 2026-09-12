@@ -2842,7 +2842,7 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let requested_intent = self.undo_manager.pending_intent.take();
+        let mut requested_intent = self.undo_manager.pending_intent.take();
         if !self.is_editable() {
             return;
         }
@@ -2857,10 +2857,9 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         // NOTE: The normalization keeps the UTF-16 length, but may change the
         // UTF-8 byte length, so all the byte-offset calculations below must
         // use the normalized text.
-        let new_text = self.normalize_input(new_text);
-        let new_text: &str = &new_text;
+        let mut new_text = self.normalize_input(new_text);
 
-        let range = range_utf16
+        let mut range = range_utf16
             .as_ref()
             .map(|range_utf16| self.range_from_utf16(range_utf16))
             .or(self.ime_marked_range.map(|range| {
@@ -2868,6 +2867,50 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
                 self.range_from_utf16(&range)
             }))
             .unwrap_or(self.selected_range.into());
+
+        // Only direct character typing may dedent. Paste, commands, explicit
+        // replacements and IME retain their exact replacement semantics.
+        if new_text == "}"
+            && requested_intent.is_none()
+            && !self.silent_replace_text
+            && range_utf16.is_none()
+            && self.ime_marked_range.is_none()
+            && range.is_empty()
+            && self.is_code_editor()
+        {
+            let row = self.text.offset_to_point(range.start).row;
+            let start = self.text.line_start_offset(row);
+            let end = super::rope_ext::clip_crlf_offset(&self.text, self.text.line_end_offset(row));
+            if range.start <= end
+                && range.start - start <= 16 * 1024
+                && end.saturating_sub(range.start) <= 16 * 1024
+                && self
+                    .text
+                    .slice(start..end)
+                    .chars()
+                    .all(|c| matches!(c, ' ' | '\t'))
+            {
+                let indent = self.mode.highlighter().and_then(|highlighter| {
+                    highlighter.borrow().as_ref().and_then(|highlighter| {
+                        highlighter.closing_brace_indent(&self.text, range.start)
+                    })
+                });
+                if let Some(indent) = indent.filter(|indent| {
+                    indent.len() < range.start - start
+                        && indent.chars().all(|c| matches!(c, ' ' | '\t'))
+                        && self
+                            .text
+                            .slice(start..start + indent.len())
+                            .chars()
+                            .eq(indent.chars())
+                }) {
+                    range.start = start;
+                    new_text = Cow::Owned(format!("{indent}}}"));
+                    requested_intent = Some(EditIntent::Atomic);
+                }
+            }
+        }
+        let new_text: &str = &new_text;
 
         let old_text = self.text.clone();
         self.text.replace(range.clone(), new_text);

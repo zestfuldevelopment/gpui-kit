@@ -97,6 +97,14 @@ pub trait InputHighlighter {
         None
     }
 
+    /// Suggest the opener's indentation before typing a single `}` at `caret`.
+    /// The caret is on an otherwise whitespace-only line. Return `None` for
+    /// uncertain or stale syntax; this query must not synchronously parse.
+    /// Base validates whitespace and combines dedent with typing in one edit.
+    fn closing_brace_indent(&self, _text: &Rope, _caret: usize) -> Option<String> {
+        None
+    }
+
     /// Match a structural bracket adjacent to a UTF-8 byte caret offset.
     /// The bracket after the caret takes precedence. Missing or uncertain
     /// syntax returns `None`; this query must not synchronously parse text.

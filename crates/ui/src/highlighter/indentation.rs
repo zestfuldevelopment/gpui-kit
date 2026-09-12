@@ -200,6 +200,99 @@ pub(super) fn newline_indent(
     None
 }
 
+/// Find an unmatched structural brace in the current host tree. Traverse once,
+/// skipping literals and comments; every cursor movement consumes the same
+/// finite budget. Missing parser closers do not balance actual opening tokens.
+pub(super) fn closing_brace_indent(
+    highlighter: &SyntaxHighlighter,
+    text: &Rope,
+    caret: usize,
+) -> Option<String> {
+    use super::syntax_tokens::{MAX_CURSOR_STEPS, protected};
+
+    if !matches!(
+        highlighter.language().as_ref(),
+        "rust" | "javascript" | "typescript" | "tsx" | "python" | "json" | "css" | "toml" | "yaml"
+    ) {
+        return None;
+    }
+    let root = highlighter.tree()?.root_node();
+    if root.has_changes() || caret > text.len() {
+        return None;
+    }
+    let line_start = text.line_start_offset(text.offset_to_point(caret).row);
+    let mut cursor = root.walk();
+    let mut stack = Vec::new();
+    let mut budget = MAX_CURSOR_STEPS;
+    let mut gap_budget = MAX_LINE_BYTES;
+    let mut covered = 0;
+    'walk: loop {
+        budget = budget.checked_sub(1)?;
+        let node = cursor.node();
+        if node.start_byte() >= caret {
+            break;
+        }
+        let literal = protected(node.kind());
+        // Completed named syntax before this line cannot leave a delimiter
+        // open. Skip whole earlier functions/statements and valid lifetimes,
+        // rather than spending the budget descending unrelated syntax.
+        let complete = node.is_named() && !node.has_error() && node.end_byte() <= line_start;
+        if literal && node.start_byte() < caret && node.end_byte() >= caret {
+            return None;
+        }
+        if !node.is_missing() && (literal || complete || node.child_count() == 0) {
+            whitespace_gap(text, covered, node.start_byte(), &mut gap_budget)?;
+            covered = node.end_byte();
+            // Incomplete literals can lose their named wrapper in ERROR nodes.
+            // Unrepresented text is rejected by whitespace_gap as well (e.g.
+            // Rust's incomplete raw-string prefix is absent from the tree).
+            if !literal && !complete && matches!(node.kind(), "\"" | "'" | "`" | "/*" | "//") {
+                return None;
+            }
+        }
+        if !literal && !complete && !node.is_missing() {
+            if node.child_count() > 0 {
+                if cursor.goto_first_child() {
+                    continue;
+                }
+            } else if node.end_byte() <= caret && node.end_byte() - node.start_byte() == 1 {
+                match node.kind() {
+                    "{" | "[" | "(" => stack.push((node.kind(), node.start_byte())),
+                    "}" | "]" | ")" => {
+                        let (opening, _) = stack.pop()?;
+                        if !matches!((opening, node.kind()), ("{", "}") | ("[", "]") | ("(", ")")) {
+                            return None;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        loop {
+            budget = budget.checked_sub(1)?;
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                break 'walk;
+            }
+        }
+    }
+    whitespace_gap(text, covered, caret, &mut gap_budget)?;
+    let (opening, offset) = stack.last()?;
+    (*opening == "{" && *offset < line_start)
+        .then(|| line_indent(text, *offset))
+        .flatten()
+}
+
+fn whitespace_gap(text: &Rope, start: usize, end: usize, budget: &mut usize) -> Option<()> {
+    *budget = budget.checked_sub(end.checked_sub(start)?)?;
+    text.slice(start..end)
+        .chars()
+        .all(|c| matches!(c, ' ' | '\t' | '\r' | '\n'))
+        .then_some(())
+}
+
 fn closer_is_code(root: Node<'_>, text: &Rope, start: usize) -> bool {
     let end = start
         + if text.char_at(start) == Some('<') {
@@ -295,6 +388,20 @@ fn line_indent(text: &Rope, offset: usize) -> Option<String> {
 #[cfg(all(test, feature = "tree-sitter-rust"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_closer_exhausts_syntax_and_gap_budgets_conservatively() {
+        for source in [
+            format!("{}fn f() {{\n  ", "fn earlier() {}\n".repeat(5_000)),
+            format!("fn f() {{\n{}  ", "if true {\n".repeat(5_000)),
+            format!("fn f() {{{}  ", "\n".repeat(MAX_LINE_BYTES + 1)),
+        ] {
+            let text = Rope::from(source.as_str());
+            let mut highlighter = SyntaxHighlighter::new("rust");
+            assert!(highlighter.update(None, &text, None));
+            assert!(closing_brace_indent(&highlighter, &text, text.len()).is_none());
+        }
+    }
 
     #[test]
     fn broad_and_deep_syntax_exhausts_lookup_budget_conservatively() {

@@ -84,7 +84,7 @@ fn token_containing<'tree>(root: Node<'tree>, text: &Rope, end: usize) -> Option
     (!path.is_empty()).then_some(Token { path })
 }
 
-fn protected(kind: &str) -> bool {
+pub(super) fn protected(kind: &str) -> bool {
     kind.contains("comment")
         || kind.contains("string")
         || matches!(
