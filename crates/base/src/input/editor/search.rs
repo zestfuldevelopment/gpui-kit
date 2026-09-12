@@ -235,7 +235,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         // Anchor beyond inserted text so a replacement containing the query
         // cannot repeatedly replace its own newly inserted first match.
         let old_len = self.text.len();
-        if self.text.slice(range.clone()).to_string() != replacement {
+        if self.text.slice(range.clone()) != replacement {
             self.search_session.matcher.begin_replacement();
             self.undo_manager.pending_intent = Some(crate::input::undo_manager::EditIntent::Atomic);
             let range_utf16 = self.range_to_utf16(&range);
@@ -275,7 +275,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         // Reverse order keeps each saved byte range valid. Each edit uses the
         // normal UTF-16 input/history path and adjusts only overlapping folds.
         for range in ranges.iter().rev() {
-            if self.text.slice(range.clone()).to_string() == replacement {
+            if self.text.slice(range.clone()) == replacement {
                 continue;
             }
             self.undo_manager.pending_intent = Some(crate::input::undo_manager::EditIntent::Atomic);
