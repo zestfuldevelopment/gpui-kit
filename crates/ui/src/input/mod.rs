@@ -42,3 +42,8 @@ pub use number_input::{NumberInput, NumberInputEvent, NumberStep, StepAction};
 pub use otp_input::*;
 pub use state::AnyInputState;
 pub use textarea::Textarea;
+
+/// Register input overlay keyboard commands.
+pub(crate) fn init(cx: &mut gpui::App) {
+    search::init(cx);
+}

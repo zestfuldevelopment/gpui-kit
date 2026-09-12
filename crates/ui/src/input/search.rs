@@ -2,8 +2,8 @@ use rust_i18n::t;
 
 use gpui::{
     App, AppContext as _, Context, Empty, Entity, FocusHandle, Focusable, Half,
-    InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render, Styled, Subscription,
-    WeakEntity, Window, actions, div, prelude::FluentBuilder as _,
+    InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, Pixels, Render, Styled,
+    Subscription, WeakEntity, Window, actions, div, prelude::FluentBuilder as _,
 };
 
 use crate::{
@@ -15,12 +15,29 @@ use crate::{
         Replace, Search,
     },
     label::Label,
+    tooltip::{ManagedTooltipExt as _, Tooltip},
     v_flex,
 };
 
 const CONTEXT: &'static str = "SearchPanel";
 
-actions!(input, [Tab]);
+actions!(input, [Tab, TabPrev]);
+
+pub(super) fn init(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("tab", Tab, Some(CONTEXT)),
+        KeyBinding::new("shift-tab", TabPrev, Some(CONTEXT)),
+        KeyBinding::new("escape", Escape, Some(CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-f", Search, Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-f", Search, Some(CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-shift-f", Replace, Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-h", Replace, Some(CONTEXT)),
+    ]);
+}
 
 #[cfg(test)]
 use gpui_base::input::SearchMatcher;
@@ -60,6 +77,14 @@ pub(super) struct SearchPanel<M: crate::input::overlay::OverlayMode> {
     editor: WeakEntity<InputBaseState<M>>,
     search_input: Entity<InputState>,
     replace_input: Entity<InputState>,
+    case_focus: FocusHandle,
+    word_focus: FocusHandle,
+    replace_mode_focus: FocusHandle,
+    previous_focus: FocusHandle,
+    next_focus: FocusHandle,
+    replace_current_focus: FocusHandle,
+    replace_all_focus: FocusHandle,
+    close_focus: FocusHandle,
     session: gpui_base::input::SearchSession,
     input_width: Pixels,
 
@@ -128,6 +153,14 @@ impl<M: crate::input::overlay::OverlayMode> SearchPanel<M> {
                 editor: editor.downgrade(),
                 search_input,
                 replace_input,
+                case_focus: cx.focus_handle(),
+                word_focus: cx.focus_handle(),
+                replace_mode_focus: cx.focus_handle(),
+                previous_focus: cx.focus_handle(),
+                next_focus: cx.focus_handle(),
+                replace_current_focus: cx.focus_handle(),
+                replace_all_focus: cx.focus_handle(),
+                close_focus: cx.focus_handle(),
                 session: gpui_base::input::SearchSession::default(),
                 input_width: Pixels::ZERO,
                 _subscriptions,
@@ -170,6 +203,20 @@ impl<M: crate::input::overlay::OverlayMode> SearchPanel<M> {
     }
 
     fn on_action_enter(&mut self, action: &Enter, window: &mut Window, cx: &mut Context<Self>) {
+        if !self
+            .search_input
+            .read(cx)
+            .focus_handle(cx)
+            .is_focused(window)
+            && !self
+                .replace_input
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+        {
+            cx.propagate();
+            return;
+        }
         if action.shift {
             self.prev(window, cx);
         } else {
@@ -182,7 +229,7 @@ impl<M: crate::input::overlay::OverlayMode> SearchPanel<M> {
     }
 
     fn on_action_tab(&mut self, _: &IndentInline, window: &mut Window, cx: &mut Context<Self>) {
-        self.cycle_focus(window, cx);
+        self.cycle_focus(false, window, cx);
     }
 
     fn on_action_tab_prev(
@@ -191,25 +238,55 @@ impl<M: crate::input::overlay::OverlayMode> SearchPanel<M> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.cycle_focus(window, cx);
+        self.cycle_focus(true, window, cx);
     }
 
-    /// Cycle focus between the search and the replace input, to keep the Tab key
-    /// staying in the panel.
-    ///
-    /// There are only 2 inputs, so the forward and the backward are the same.
-    fn cycle_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.session.replace_mode || !self.replaceable(cx) {
-            return;
-        }
+    fn on_action_control_tab(&mut self, _: &Tab, window: &mut Window, cx: &mut Context<Self>) {
+        self.cycle_focus(false, window, cx);
+    }
 
-        let search_focus_handle = self.search_input.read(cx).focus_handle(cx);
-        let focus_handle = if search_focus_handle.is_focused(window) {
-            self.replace_input.read(cx).focus_handle(cx)
-        } else {
-            search_focus_handle
-        };
-        focus_handle.focus(window, cx);
+    fn on_action_control_tab_prev(
+        &mut self,
+        _: &TabPrev,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cycle_focus(true, window, cx);
+    }
+
+    /// Keep the fixed order even if the focused button becomes disabled after
+    /// replacement. The next Tab can then advance to the next enabled control.
+    fn cycle_focus(&mut self, reverse: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let replaceable = self.replaceable(cx);
+        let replacing = self.session.replace_mode && replaceable;
+        let matches = !self.session.matcher.is_empty();
+        let controls = [
+            (self.search_input.read(cx).focus_handle(cx), true),
+            (self.replace_input.read(cx).focus_handle(cx), replacing),
+            (self.case_focus.clone(), true),
+            (self.word_focus.clone(), true),
+            (self.replace_mode_focus.clone(), replaceable),
+            (self.previous_focus.clone(), matches),
+            (self.next_focus.clone(), matches),
+            (self.replace_current_focus.clone(), replacing && matches),
+            (self.replace_all_focus.clone(), replacing && matches),
+            (self.close_focus.clone(), true),
+        ];
+        let current = controls
+            .iter()
+            .position(|(handle, _)| handle.is_focused(window))
+            .unwrap_or(0);
+        for step in 1..=controls.len() {
+            let next = if reverse {
+                (current + controls.len() - step) % controls.len()
+            } else {
+                (current + step) % controls.len()
+            };
+            if controls[next].1 {
+                controls[next].0.focus(window, cx);
+                break;
+            }
+        }
     }
 
     fn on_action_search(&mut self, _: &Search, _: &mut Window, cx: &mut Context<Self>) {
@@ -301,6 +378,20 @@ impl<M: crate::input::overlay::OverlayMode> Render for SearchPanel<M> {
             self.session.replace_mode = false;
         }
 
+        let replacement_visibility_label = if self.session.replace_mode {
+            "Hide replacement"
+        } else {
+            "Show replacement"
+        };
+        let match_label = if has_matches {
+            format!(
+                "Match {} of {}",
+                self.session.matcher.current_match_index() + 1,
+                self.session.matcher.len()
+            )
+        } else {
+            "No matches".to_owned()
+        };
         v_flex()
             .id("search-panel")
             .occlude()
@@ -310,6 +401,8 @@ impl<M: crate::input::overlay::OverlayMode> Render for SearchPanel<M> {
             .on_action(cx.listener(Self::on_action_escape))
             .on_action(cx.listener(Self::on_action_tab))
             .on_action(cx.listener(Self::on_action_tab_prev))
+            .on_action(cx.listener(Self::on_action_control_tab))
+            .on_action(cx.listener(Self::on_action_control_tab_prev))
             .on_action(cx.listener(Self::on_action_replace))
             .on_action(cx.listener(Self::on_action_search))
             .font_family(cx.theme().font_family.clone())
@@ -327,18 +420,28 @@ impl<M: crate::input::overlay::OverlayMode> Render for SearchPanel<M> {
                     .w_full()
                     .gap_2()
                     .child(
+                        div().id("find-label").w_12().flex_shrink_0()
+                            .child(Label::new("Find"))
+                            .managed_tooltip(|window, cx| {
+                                Tooltip::new("Find matches literal text. Regular expressions are not interpreted.")
+                                    .build(window, cx)
+                            }),
+                    )
+                    .child(
                         div()
                             .flex()
                             .flex_1()
                             .gap_1()
                             .child(
                                 Input::new(&self.search_input)
-                                    .focus_bordered(false)
+                                    .aria_label("Find")
+                                    .focus_bordered(true)
                                     .suffix(
                                         h_flex()
                                             .gap_1()
                                             .child(
                                                 Button::new("case-insensitive")
+                                                    .track_focus(&self.case_focus)
                                                     .selected(!self.session.case_insensitive)
                                                     .toggled(!self.session.case_insensitive)
                                                     .xsmall()
@@ -356,6 +459,7 @@ impl<M: crate::input::overlay::OverlayMode> Render for SearchPanel<M> {
                                             )
                                             .child(
                                                 Button::new("whole-word")
+                                                    .track_focus(&self.word_focus)
                                                     .selected(self.session.whole_word)
                                                     .toggled(self.session.whole_word)
                                                     .xsmall()
@@ -390,9 +494,12 @@ impl<M: crate::input::overlay::OverlayMode> Render for SearchPanel<M> {
                     .when(allow_replace, |this| {
                         this.child(
                             Button::new("replace-mode")
+                                .track_focus(&self.replace_mode_focus)
                                 .xsmall()
                                 .ghost()
                                 .icon(IconName::Replace)
+                                .accessibility_label(replacement_visibility_label)
+                                .tooltip(replacement_visibility_label)
                                 .selected(self.session.replace_mode)
                                 .toggled(self.session.replace_mode)
                                 .on_click(cx.listener(|this, _, window, cx| {
@@ -402,9 +509,12 @@ impl<M: crate::input::overlay::OverlayMode> Render for SearchPanel<M> {
                     })
                     .child(
                         Button::new("prev")
+                            .track_focus(&self.previous_focus)
                             .xsmall()
                             .ghost()
                             .icon(IconName::ChevronLeft)
+                            .accessibility_label("Previous match")
+                            .tooltip("Previous match (Shift+Enter)")
                             .disabled(!has_matches)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.prev(window, cx);
@@ -412,16 +522,19 @@ impl<M: crate::input::overlay::OverlayMode> Render for SearchPanel<M> {
                     )
                     .child(
                         Button::new("next")
+                            .track_focus(&self.next_focus)
                             .xsmall()
                             .ghost()
                             .icon(IconName::ChevronRight)
+                            .accessibility_label("Next match")
+                            .tooltip("Next match (Enter)")
                             .disabled(!has_matches)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.next(window, cx);
                             })),
                     )
                     .child(
-                        Label::new(self.session.matcher.label())
+                        Label::new(match_label)
                             .when(!has_matches, |this| {
                                 this.text_color(cx.theme().muted_foreground)
                             })
@@ -431,9 +544,12 @@ impl<M: crate::input::overlay::OverlayMode> Render for SearchPanel<M> {
                     .child(div().w_7())
                     .child(
                         Button::new("close")
+                            .track_focus(&self.close_focus)
                             .xsmall()
                             .ghost()
                             .icon(IconName::Close)
+                            .accessibility_label("Close find")
+                            .tooltip("Close find (Escape)")
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.on_action_escape(&Escape, window, cx);
                             })),
@@ -448,16 +564,28 @@ impl<M: crate::input::overlay::OverlayMode> Render for SearchPanel<M> {
                         .w_full()
                         .gap_2()
                         .child(
+                            div().id("replace-label").w_12().flex_shrink_0()
+                                .child(Label::new("Replace"))
+                                .managed_tooltip(|window, cx| {
+                                    Tooltip::new("Replacement text is inserted literally. Leave empty to delete matches.")
+                                        .build(window, cx)
+                                }),
+                        )
+                        .child(
                             Input::new(&self.replace_input)
-                                .focus_bordered(false)
+                                .aria_label("Replace")
+                                .focus_bordered(true)
                                 .small()
                                 .w(self.input_width)
                                 .shadow_none(),
                         )
                         .child(
                             Button::new("replace-one")
+                                .track_focus(&self.replace_current_focus)
                                 .small()
                                 .label(t!("Input.Replace"))
+                                .accessibility_label("Replace current match")
+                                .tooltip("Replace current match with literal replacement text")
                                 .disabled(!has_matches)
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.replace_next(window, cx);
@@ -465,8 +593,11 @@ impl<M: crate::input::overlay::OverlayMode> Render for SearchPanel<M> {
                         )
                         .child(
                             Button::new("replace-all")
+                                .track_focus(&self.replace_all_focus)
                                 .small()
                                 .label(t!("Input.Replace All"))
+                                .accessibility_label("Replace all matches")
+                                .tooltip("Replace all matches with literal replacement text")
                                 .disabled(!has_matches)
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.replace_all(window, cx);

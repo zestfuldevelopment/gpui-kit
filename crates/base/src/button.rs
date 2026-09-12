@@ -232,11 +232,14 @@ impl RenderOnce for Button {
             .when_some(self.accessibility_label, |this, label| {
                 this.aria_label(label)
             })
-            .when(!disabled && self.focusable, |this| {
+            // Retain the dispatch path if an already-focused button becomes
+            // disabled. It cannot activate or become a Tab stop, but keyboard
+            // navigation can still reach its parent and move focus away.
+            .when(self.focusable, |this| {
                 this.track_focus(
                     &focus_handle
                         .tab_index(self.tab_index)
-                        .tab_stop(self.tab_stop),
+                        .tab_stop(self.tab_stop && !disabled),
                 )
             })
             .when(disabled, |this| {
@@ -331,6 +334,73 @@ mod tests {
             window.draw(cx).clear(cx);
         });
         (cx, button_clicks, parent_clicks, keyboard_events)
+    }
+
+    #[gpui::test]
+    fn disabled_button_keeps_parent_keyboard_navigation(cx: &mut TestAppContext) {
+        struct NavigationHarness {
+            disabled: bool,
+            focus: FocusHandle,
+            navigation_keys: Rc<Cell<usize>>,
+            clicks: Rc<Cell<usize>>,
+        }
+        impl Render for NavigationHarness {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let navigation_keys = self.navigation_keys.clone();
+                let clicks = self.clicks.clone();
+                let parent_clicks = self.clicks.clone();
+                div().child(
+                    div()
+                        .id("panel")
+                        .on_click(move |_, _, _| parent_clicks.set(parent_clicks.get() + 1))
+                        .on_key_down(move |event, _, _| {
+                            if matches!(event.keystroke.key.as_str(), "tab" | "escape") {
+                                navigation_keys.set(navigation_keys.get() + 1);
+                            }
+                        })
+                        .child(
+                            Button::new("action")
+                                .track_focus(&self.focus)
+                                .disabled(self.disabled)
+                                .child("Replace all")
+                                .on_click(move |_, _, _| clicks.set(clicks.get() + 1)),
+                        ),
+                )
+            }
+        }
+        let navigation_keys = Rc::new(Cell::new(0));
+        let clicks = Rc::new(Cell::new(0));
+        let (view, cx) = cx.add_window_view({
+            let navigation_keys = navigation_keys.clone();
+            let clicks = clicks.clone();
+            move |_, cx| NavigationHarness {
+                disabled: false,
+                focus: cx.focus_handle(),
+                navigation_keys,
+                clicks,
+            }
+        });
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            view.read(cx).focus.clone().focus(window, cx);
+            window.draw(cx).clear(cx);
+            view.update(cx, |view, cx| {
+                view.disabled = true;
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        });
+        for key in ["enter", "space", "tab", "escape"] {
+            let keystroke = Keystroke::parse(key).unwrap();
+            cx.simulate_event(KeyDownEvent {
+                keystroke: keystroke.clone(),
+                is_held: false,
+                prefer_character_input: false,
+            });
+            cx.simulate_event(KeyUpEvent { keystroke });
+        }
+        assert_eq!(clicks.get(), 0);
+        assert_eq!(navigation_keys.get(), 2);
     }
 
     #[gpui::test]
