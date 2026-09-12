@@ -108,6 +108,8 @@ actions!(
         ToggleCodeActions,
         Search,
         Replace,
+        NextSearchMatch,
+        PreviousSearchMatch,
         GoToDefinition,
     ]
 );
@@ -124,6 +126,8 @@ pub(super) const CONTEXT: &str = "Input";
 
 pub(crate) fn init(cx: &mut App) {
     cx.bind_keys([
+        KeyBinding::new("f3", NextSearchMatch, Some(CONTEXT)),
+        KeyBinding::new("shift-f3", PreviousSearchMatch, Some(CONTEXT)),
         KeyBinding::new("backspace", Backspace, Some(CONTEXT)),
         KeyBinding::new("shift-backspace", Backspace, Some(CONTEXT)),
         #[cfg(target_os = "macos")]
@@ -2138,12 +2142,19 @@ impl<M: InputModeKind> InputBaseState<M> {
         if let Some(changes) = self.undo_manager.undo() {
             let selection = changes.last().unwrap().selection_before;
             let reversed = changes.last().unwrap().selection_before_reversed;
+            let old_text = self.text.clone();
+            if changes.len() > 1 {
+                self.undo_manager.begin_atomic_batch();
+            }
             for change in &changes {
                 let range_utf16 = self.range_to_utf16(&change.new_range.into());
                 self.replace_text_in_range_silent(Some(range_utf16), &change.old_text, window, cx);
             }
             self.selected_range = selection;
             self.selection_reversed = reversed;
+            if changes.len() > 1 {
+                self.finish_atomic_edit_batch(old_text, window, cx);
+            }
         }
         self.undo_manager.set_ignoring(false);
     }
@@ -2153,12 +2164,19 @@ impl<M: InputModeKind> InputBaseState<M> {
         if let Some(changes) = self.undo_manager.redo() {
             let selection = changes.last().unwrap().selection_after;
             let reversed = changes.last().unwrap().selection_after_reversed;
+            let old_text = self.text.clone();
+            if changes.len() > 1 {
+                self.undo_manager.begin_atomic_batch();
+            }
             for change in &changes {
                 let range_utf16 = self.range_to_utf16(&change.old_range.into());
                 self.replace_text_in_range_silent(Some(range_utf16), &change.new_text, window, cx);
             }
             self.selected_range = selection;
             self.selection_reversed = reversed;
+            if changes.len() > 1 {
+                self.finish_atomic_edit_batch(old_text, window, cx);
+            }
         }
         self.undo_manager.set_ignoring(false);
     }
@@ -2746,6 +2764,49 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.silent_replace_text = false;
     }
 
+    /// Publish a completed batch after each edit has adjusted folds and history.
+    /// A whole-text refresh here does not perform a whole-text edit: closed
+    /// sibling folds keep the coordinates established by the individual edits.
+    pub(super) fn finish_atomic_edit_batch(
+        &mut self,
+        old_text: Rope,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.undo_manager.commit_atomic_batch();
+        if old_text == self.text {
+            return;
+        }
+        let range = 0..old_text.len();
+        if let Some(diagnostics) = self.mode.diagnostics_mut() {
+            diagnostics.reset(&self.text);
+        }
+        self.display_map
+            .on_text_changed(&self.text, &range, &self.text, cx);
+        self.mode.update_highlighter::<M>(
+            super::mode::HighlighterUpdate {
+                selected_range: &range,
+                old_text: &old_text,
+                new_text: &self.text,
+                change_text: &self.text.to_string(),
+                force: true,
+            },
+            window,
+            cx,
+        );
+        self.update_fold_candidates();
+        M::refresh_language_features(self, window, cx);
+        self.update_preferred_column();
+        self.update_search(cx);
+        if self.is_multi_line() {
+            self.mode.update_auto_grow(&self.display_map);
+        }
+        if self.emit_events {
+            cx.emit(InputEvent::Change);
+        }
+        cx.notify();
+    }
+
     /// Update fold candidates from tree-sitter syntax tree (full extraction).
     /// Used only on initial load or language changes.
     fn update_fold_candidates(&mut self) {
@@ -2980,12 +3041,18 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         // edit into the same change, which then carries the text and selection
         // of the first composition.
         self.undo_manager.commit_transaction();
+        // Fold and annotation coordinates must track every localized edit,
+        // even when display/parsing and observers see only the finished batch.
+        self.display_map
+            .adjust_folds_for_edit(&old_text, &range, new_text);
+        if self.undo_manager.is_atomic_batch() {
+            self.selected_range = (new_offset..new_offset).into();
+            self.ime_marked_range.take();
+            return;
+        }
         if let Some(diagnostics) = self.mode.diagnostics_mut() {
             diagnostics.reset(&self.text)
         }
-        // Adjust folds before updating wrap map: remove overlapping folds and shift others
-        self.display_map
-            .adjust_folds_for_edit(&old_text, &range, new_text);
         self.display_map
             .on_text_changed(&self.text, &range, &Rope::from(new_text), cx);
 
@@ -3295,6 +3362,10 @@ impl<M: InputModeKind> Render for InputBaseState<M> {
             .on_action(window.listener_for(&entity, InputBaseState::select_to_end))
             .on_action(window.listener_for(&entity, InputBaseState::show_character_palette))
             .on_action(window.listener_for(&entity, InputBaseState::copy))
+            .on_action(window.listener_for(&entity, InputBaseState::on_action_next_search_match))
+            .on_action(
+                window.listener_for(&entity, InputBaseState::on_action_previous_search_match),
+            )
             .on_action(window.listener_for(&entity, InputBaseState::on_action_search))
             .on_action(window.listener_for(&entity, InputBaseState::on_action_replace))
             .on_key_down(window.listener_for(&entity, InputBaseState::on_key_down))
@@ -5152,6 +5223,237 @@ mod tests {
                 assert_eq!(state.selected_range(), selection_after_edit);
             });
         });
+    }
+
+    #[gpui::test]
+    fn search_starts_at_caret_and_close_selects_match(cx: &mut TestAppContext) {
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        cx.update(|window, cx| {
+            view.input.update(cx, |state, cx| {
+                state.set_value("foo foo foo", window, cx);
+                state.set_selected_range(4..4, cx);
+                state.set_search_query("foo", false, cx);
+                state.open_search(false, cx);
+                assert_eq!(state.search_session.matcher.current_match_index(), 1);
+                assert_eq!(state.next_search_match(cx), Some(8..11));
+                assert_eq!(state.next_search_match(cx), Some(0..3));
+                assert_eq!(state.previous_search_match(cx), Some(8..11));
+                state.close_search(cx);
+                assert_eq!(state.selected_range(), 8..11);
+                state.set_selected_range(4..4, cx);
+                state.open_search(false, cx);
+                state.set_search_query("missing", false, cx);
+                state.close_search(cx);
+                assert_eq!(state.selected_range(), 4..4);
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn search_replace_advances_beyond_inserted_query(cx: &mut TestAppContext) {
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        cx.update(|window, cx| {
+            view.input.update(cx, |state, cx| {
+                state.set_value("foo foo", window, cx);
+                state.set_search_query("foo", false, cx);
+                assert!(state.replace_current_search_match("foofoo", window, cx));
+                assert_eq!(
+                    state.search_session.matcher.matched_ranges()
+                        [state.search_session.matcher.current_match_index()],
+                    7..10
+                );
+                assert!(state.replace_current_search_match("é", window, cx));
+                assert_eq!(state.value(), "foofoo é");
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.value(), "foofoo foo");
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.value(), "foo foo");
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn search_replace_all_preserves_unicode_crlf_folds_and_undo_selection(cx: &mut TestAppContext) {
+        use crate::input::FoldRange;
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        cx.update(|window, cx| {
+            view.input.update(cx, |state, cx| {
+                let source = "café\r\nfn other() {\r\n    body();\r\n}\r\nCAFÉ\r\n";
+                state.set_value(source, window, cx);
+                state.apply_highlighter_fold_candidates(vec![FoldRange::new(1, 3)], cx);
+                state.display_map.set_folded(1, true);
+                state.set_selected_range(0..5, cx);
+                state.selection_reversed = true;
+                state.set_search_query("café", true, cx);
+                assert_eq!(state.replace_all_search_matches("猫😀", window, cx), 2);
+                assert_eq!(
+                    state.value(),
+                    "猫😀\r\nfn other() {\r\n    body();\r\n}\r\n猫😀\r\n"
+                );
+                assert_eq!(state.display_map.folded_ranges().len(), 1);
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.value(), source);
+                assert_eq!(state.selected_range(), 0..5);
+                assert!(state.selection_reversed);
+                state.redo(&Redo, window, cx);
+                assert_eq!(
+                    state.value(),
+                    "猫😀\r\nfn other() {\r\n    body();\r\n}\r\n猫😀\r\n"
+                );
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn search_reveals_only_covering_folds(cx: &mut TestAppContext) {
+        use crate::input::FoldRange;
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        cx.update(|window, cx| {
+            view.input.update(cx, |state, cx| {
+                state.set_value("foo\nfn a() {\n foo\n}\nfn b() {\n other\n}", window, cx);
+                state.apply_highlighter_fold_candidates(
+                    vec![FoldRange::new(1, 3), FoldRange::new(4, 6)],
+                    cx,
+                );
+                state.display_map.set_folded(1, true);
+                state.display_map.set_folded(4, true);
+                state.set_selected_range(0..0, cx);
+                state.set_search_query("foo", false, cx);
+                state.open_search(false, cx);
+                assert_eq!(state.next_search_match(cx), Some(14..17));
+                assert_eq!(state.display_map.folded_ranges().len(), 1);
+                assert_eq!(state.display_map.folded_ranges()[0].start_line, 4);
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn search_options_and_query_changes_keep_open_anchor(cx: &mut TestAppContext) {
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        cx.update(|window, cx| {
+            view.input.update(cx, |state, cx| {
+                state.set_value("foo café foo CAFÉ caféine", window, cx);
+                state.set_selected_range(10..10, cx);
+                state.open_search(false, cx);
+                let revision = state.search_session.focus_revision;
+                state.set_search_query("café", true, cx);
+                state.set_search_whole_word(true, cx);
+                assert_eq!(state.search_session.matcher.current_match_index(), 1);
+                assert_eq!(state.search_session.matcher.len(), 2);
+                assert_eq!(state.search_session.focus_revision, revision);
+                state.open_search(false, cx);
+                assert_eq!(state.search_session.focus_revision, revision + 1);
+                state.set_search_query("foo", false, cx);
+                assert_eq!(state.search_session.matcher.current_match_index(), 1);
+                state.close_search(cx);
+                assert_eq!(state.selected_range(), 10..13);
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn search_identical_replacement_advances_without_history(cx: &mut TestAppContext) {
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        cx.update(|window, cx| {
+            view.input.update(cx, |state, cx| {
+                state.set_value("foo foo", window, cx);
+                state.set_selected_range(7..7, cx);
+                state.replace_text_in_range(None, "!", window, cx);
+                state.set_search_query("foo", false, cx);
+                state.search_session.matcher.update_cursor_by_offset(0);
+                assert!(state.replace_current_search_match("foo", window, cx));
+                assert_eq!(state.search_session.matcher.current_match_index(), 1);
+                assert!(state.replace_current_search_match("foo", window, cx));
+                assert_eq!(state.search_session.matcher.current_match_index(), 0);
+                assert_eq!(state.replace_all_search_matches("foo", window, cx), 2);
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.value(), "foo foo");
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn search_single_line_keeps_normal_input_rules(cx: &mut TestAppContext) {
+        let view = InputView::build(cx, |state| state.default_value("a a"));
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        cx.update(|window, cx| {
+            view.input.update(cx, |state, cx| {
+                state.set_search_query("a", false, cx);
+                assert!(state.replace_current_search_match("a\r\n", window, cx));
+                assert_eq!(state.value(), "a a");
+                assert_eq!(state.search_session.matcher.current_match_index(), 1);
+                assert!(!state.undo_manager.has_undos());
+                assert_eq!(state.replace_all_search_matches("é\r\n", window, cx), 2);
+                assert_eq!(state.value(), "é é");
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.value(), "a a");
+            })
+        });
+    }
+
+    #[gpui::test]
+    #[ignore = "manual representative replacement timing"]
+    fn search_replace_all_representative_timing(cx: &mut TestAppContext) {
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        cx.update(|window, cx| {
+            view.input.update(cx, |state, cx| {
+                for lines in [10_000, 50_000] {
+                    state.set_value("let café = 1;\r\n".repeat(lines), window, cx);
+                    state.set_search_query("café", true, cx);
+                    let started = std::time::Instant::now();
+                    assert_eq!(state.replace_all_search_matches("猫", window, cx), lines);
+                    eprintln!("ReplaceAll {lines} lines: {:?}", started.elapsed());
+                    assert_eq!(state.value(), "let 猫 = 1;\r\n".repeat(lines));
+                    let started = std::time::Instant::now();
+                    state.undo(&Undo, window, cx);
+                    eprintln!("Undo ReplaceAll {lines} lines: {:?}", started.elapsed());
+                    assert_eq!(state.value(), "let café = 1;\r\n".repeat(lines));
+                }
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn search_replace_all_publishes_one_change_per_command(cx: &mut TestAppContext) {
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let changes = Rc::new(Cell::new(0));
+        let sink = changes.clone();
+        cx.update(|window, cx| {
+            view.input.update(cx, |state, cx| {
+                state.set_value("foo foo foo", window, cx);
+                state.set_search_query("foo", false, cx);
+            });
+            cx.subscribe(&view.input, move |_, event: &InputEvent, _| {
+                if matches!(event, InputEvent::Change) {
+                    sink.set(sink.get() + 1);
+                }
+            })
+            .detach();
+        });
+        cx.update(|window, cx| {
+            view.input.update(cx, |state, cx| {
+                assert_eq!(state.replace_all_search_matches("bar", window, cx), 3);
+            })
+        });
+        assert_eq!(changes.get(), 1);
+        cx.update(|window, cx| {
+            view.input
+                .update(cx, |state, cx| state.undo(&Undo, window, cx))
+        });
+        assert_eq!(changes.get(), 2);
+        cx.update(|window, cx| {
+            view.input
+                .update(cx, |state, cx| state.redo(&Redo, window, cx))
+        });
+        assert_eq!(changes.get(), 3);
     }
 
     /// Unfolding at a position opens exactly the folds hiding it.

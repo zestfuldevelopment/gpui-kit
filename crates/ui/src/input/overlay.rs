@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 
 use gpui::{AnyElement, App, Entity, EntityId, Global, IntoElement, WeakEntity, Window};
-use ropey::Rope;
 
 use super::{
     InputBaseState, InputModeKind,
@@ -25,7 +24,7 @@ impl<M: OverlayMode> Global for InputOverlayRegistry<M> {}
 
 struct InputOverlayHost<M: OverlayMode> {
     search: Entity<SearchPanel<M>>,
-    search_signature: (bool, bool, String, Option<usize>),
+    search_signature: (bool, u64),
     /// The language-feature popovers. Only a code editor has them.
     lsp: Option<LspOverlays>,
 }
@@ -280,7 +279,7 @@ impl<M: OverlayMode> InputOverlayHost<M> {
     fn new(state: Entity<InputBaseState<M>>, window: &mut Window, cx: &mut App) -> Self {
         Self {
             search: SearchPanel::new(state.clone(), window, cx),
-            search_signature: (false, false, String::new(), None),
+            search_signature: (false, 0),
             lsp: M::build_lsp(&state, window, cx),
         }
     }
@@ -292,48 +291,17 @@ impl<M: OverlayMode> InputOverlayHost<M> {
         cx: &mut App,
     ) -> InputOverlays {
         let snapshot = M::lsp_snapshot(state.read(cx), cx);
-        let (search_open, replace_mode, search_session) = {
-            let state = state.read(cx);
-            let search = state.search_session();
-            (search.open, search.replace_mode, search.clone())
-        };
-
-        self.search
-            .update(cx, |panel, _| panel.sync_session(&search_session));
-
-        let search_signature = (
-            search_open,
-            replace_mode,
-            search_session.query.clone(),
-            search_session.anchor_offset,
-        );
-        if search_signature != self.search_signature {
-            let (was_open, was_replace, _, was_anchor) = &self.search_signature;
-            let query_echo = search_open
-                && *was_open
-                && *was_replace == replace_mode
-                && *was_anchor == search_session.anchor_offset
-                && self.search.read(cx).query(cx) == search_session.query;
-            self.search_signature = search_signature;
-            if !query_echo {
-                self.search.update(cx, |panel, cx| {
-                    if search_open {
-                        let selected = Rope::from(search_session.query.clone());
-                        let visible = search_session.anchor_offset.map(|offset| offset..offset);
-                        panel.show_with_focus(
-                            &selected,
-                            replace_mode,
-                            visible,
-                            !cfg!(test),
-                            window,
-                            cx,
-                        );
-                    } else {
-                        panel.hide_with_focus(!cfg!(test), window, cx);
-                    }
-                });
+        let search_session = state.read(cx).search_session().clone();
+        let search_open = search_session.open;
+        let search_signature = (search_open, search_session.focus_revision);
+        let focus_requested = search_open && search_signature != self.search_signature;
+        self.search_signature = search_signature;
+        self.search.update(cx, |panel, cx| {
+            panel.sync_session(&search_session, window, cx);
+            if focus_requested && !cfg!(test) {
+                panel.focus_search(window, cx);
             }
-        }
+        });
 
         if let (Some(lsp), Some(snapshot)) = (self.lsp.as_mut(), snapshot.as_ref()) {
             M::sync_lsp(lsp, state, snapshot, window, cx);

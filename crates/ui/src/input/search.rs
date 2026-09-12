@@ -1,6 +1,4 @@
-use ropey::Rope;
 use rust_i18n::t;
-use std::ops::Range;
 
 use gpui::{
     App, AppContext as _, Context, Empty, Entity, FocusHandle, Focusable, Half,
@@ -69,13 +67,32 @@ pub(super) struct SearchPanel<M: crate::input::overlay::OverlayMode> {
 }
 
 impl<M: crate::input::overlay::OverlayMode> SearchPanel<M> {
-    pub(super) fn sync_session(&mut self, session: &gpui_base::input::SearchSession) {
+    pub(super) fn sync_session(
+        &mut self,
+        session: &gpui_base::input::SearchSession,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.session = session.clone();
+        if self.search_input.read(cx).value().as_ref() != session.query {
+            self.search_input.update(cx, |input, cx| {
+                input.set_value(session.query.clone(), window, cx)
+            });
+        }
+        if self.replace_input.read(cx).value().as_ref() != session.replacement {
+            self.replace_input.update(cx, |input, cx| {
+                input.set_value(session.replacement.clone(), window, cx)
+            });
+        }
     }
 
-    /// The query the panel's search input currently holds.
-    pub(super) fn query(&self, cx: &App) -> gpui::SharedString {
-        self.search_input.read(cx).value()
+    pub(super) fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_input
+            .read(cx)
+            .focus_handle(cx)
+            .focus(window, cx);
+        self.search_input
+            .update(cx, |input, cx| input.select_all(window, cx));
     }
 
     pub(crate) fn new(
@@ -87,18 +104,25 @@ impl<M: crate::input::overlay::OverlayMode> SearchPanel<M> {
         let replace_input = cx.new(|cx| InputState::new(window, cx));
 
         cx.new(|cx| {
-            let _subscriptions =
-                vec![
-                    cx.subscribe(&search_input, |this: &mut Self, _, ev: &InputEvent, cx| {
-                        // Handle search input changes
-                        match ev {
-                            InputEvent::Change => {
-                                this.update_search_query(None, cx);
-                            }
-                            _ => {}
+            let _subscriptions = vec![
+                cx.subscribe(&search_input, |this: &mut Self, _, ev: &InputEvent, cx| {
+                    // Handle search input changes
+                    match ev {
+                        InputEvent::Change => {
+                            this.update_search_query(cx);
                         }
-                    }),
-                ];
+                        _ => {}
+                    }
+                }),
+                cx.subscribe(&replace_input, |this: &mut Self, _, ev: &InputEvent, cx| {
+                    if matches!(ev, InputEvent::Change) {
+                        let replacement = this.replace_input.read(cx).value();
+                        let _ = this.editor.update(cx, |state, cx| {
+                            state.set_search_replacement(replacement.to_string(), cx);
+                        });
+                    }
+                }),
+            ];
 
             Self {
                 editor: editor.downgrade(),
@@ -111,58 +135,11 @@ impl<M: crate::input::overlay::OverlayMode> SearchPanel<M> {
         })
     }
 
-    pub(super) fn show_with_focus(
-        &mut self,
-        selected_text: &Rope,
-        replace_mode: bool,
-        visible_range_offset: Option<Range<usize>>,
-        focus: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.session.open = true;
-        self.session.replace_mode = replace_mode;
-        if focus {
-            self.search_input
-                .read(cx)
-                .focus_handle(cx)
-                .focus(window, cx);
-        }
-
-        self.search_input.update(cx, |this, cx| {
-            if selected_text.len() > 0 {
-                this.set_value(selected_text.to_string(), window, cx);
-            }
-            this.select_all(window, cx);
-        });
-
-        // The `set_value` does not emit `InputEvent::Change`, so update the query
-        // here to match the value of the search input.
-        self.update_search_query(visible_range_offset, cx);
-    }
-
-    /// Update the matcher by the value of the search input.
-    ///
-    /// The `visible_range_offset` is to select the nearest match of the visible range,
-    /// it is passed in, because the editor may be borrowed by the caller.
-    fn update_search_query(
-        &mut self,
-        visible_range_offset: Option<Range<usize>>,
-        cx: &mut Context<Self>,
-    ) {
+    fn update_search_query(&mut self, cx: &mut Context<Self>) {
         let query = self.search_input.read(cx).value();
-        let editor = self.editor.clone();
-        let _ = editor.update(cx, |state, cx| {
-            state.set_search_query(query.clone(), self.session.case_insensitive, cx);
+        let _ = self.editor.update(cx, |state, cx| {
+            state.set_search_query(query.to_string(), self.session.case_insensitive, cx);
         });
-        if let Ok(session) = editor.read_with(cx, |state, _| state.search_session().clone()) {
-            self.session = session;
-        }
-        if let Some(visible_range_offset) = visible_range_offset {
-            self.session
-                .matcher
-                .update_cursor_by_offset(visible_range_offset.start);
-        }
         cx.notify();
     }
 
@@ -349,19 +326,46 @@ impl<M: crate::input::overlay::OverlayMode> Render for SearchPanel<M> {
                                 Input::new(&self.search_input)
                                     .focus_bordered(false)
                                     .suffix(
-                                        Button::new("case-insensitive")
-                                            .selected(!self.session.case_insensitive)
-                                            .toggled(!self.session.case_insensitive)
-                                            .xsmall()
-                                            .compact()
-                                            .text()
-                                            .icon(IconName::CaseSensitive)
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.session.case_insensitive =
-                                                    !this.session.case_insensitive;
-                                                this.update_search_query(None, cx);
-                                                cx.notify();
-                                            })),
+                                        h_flex()
+                                            .gap_1()
+                                            .child(
+                                                Button::new("case-insensitive")
+                                                    .selected(!self.session.case_insensitive)
+                                                    .toggled(!self.session.case_insensitive)
+                                                    .xsmall()
+                                                    .compact()
+                                                    .text()
+                                                    .icon(IconName::CaseSensitive)
+                                                    .tooltip("Match Case")
+                                                    .accessibility_label("Match Case")
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.session.case_insensitive =
+                                                            !this.session.case_insensitive;
+                                                        this.update_search_query(cx);
+                                                        cx.notify();
+                                                    })),
+                                            )
+                                            .child(
+                                                Button::new("whole-word")
+                                                    .selected(self.session.whole_word)
+                                                    .toggled(self.session.whole_word)
+                                                    .xsmall()
+                                                    .compact()
+                                                    .text()
+                                                    .label("Word")
+                                                    .tooltip("Whole Word")
+                                                    .accessibility_label("Whole Word")
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        let whole_word = !this.session.whole_word;
+                                                        this.session.whole_word = whole_word;
+                                                        let _ =
+                                                            this.editor.update(cx, |state, cx| {
+                                                                state.set_search_whole_word(
+                                                                    whole_word, cx,
+                                                                );
+                                                            });
+                                                    })),
+                                            ),
                                     )
                                     .small()
                                     .w_full()
@@ -426,6 +430,9 @@ impl<M: crate::input::overlay::OverlayMode> Render for SearchPanel<M> {
                             })),
                     ),
             )
+            .when_some(self.session.matcher.error(), |this, error| {
+                this.child(Label::new(error.to_owned()).text_color(cx.theme().danger))
+            })
             .when(self.session.replace_mode && allow_replace, |this| {
                 this.child(
                     h_flex()
@@ -530,10 +537,10 @@ mod tests {
         assert_eq!(matcher.current_match_index(), 1);
 
         matcher.update_cursor_by_offset(30);
-        assert_eq!(matcher.current_match_index(), 2);
+        assert_eq!(matcher.current_match_index(), 0);
 
         matcher.update_cursor_by_offset(31);
-        assert_eq!(matcher.current_match_index(), 2);
+        assert_eq!(matcher.current_match_index(), 0);
     }
 
     #[test]

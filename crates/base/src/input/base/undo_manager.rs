@@ -31,6 +31,7 @@ pub(crate) struct UndoManager {
     ignoring: bool,
     transaction_open: bool,
     pending_change: Option<Change>,
+    atomic_batch: Option<Vec<Change>>,
     pub(crate) pending_intent: Option<EditIntent>,
     coalescing_boundary: bool,
 }
@@ -43,6 +44,7 @@ impl UndoManager {
             ignoring: false,
             transaction_open: false,
             pending_change: None,
+            atomic_batch: None,
             pending_intent: None,
             coalescing_boundary: false,
         }
@@ -52,7 +54,11 @@ impl UndoManager {
         if self.ignoring {
             return;
         }
-        if self.transaction_open {
+        if let Some(changes) = self.atomic_batch.as_mut() {
+            if change.old_range != change.new_range || change.old_text != change.new_text {
+                changes.push(change);
+            }
+        } else if self.transaction_open {
             // Identical IME callbacks still belong to the open composition.
             // Committing the transaction discards any net-zero change.
             if let Some(pending) = self.pending_change.as_mut() {
@@ -68,6 +74,36 @@ impl UndoManager {
         } else {
             self.push_transaction(change, intent);
         }
+    }
+
+    /// Group disjoint replacements without the IME transaction's single-range
+    /// merging. Every change retains its normal selection and byte boundaries.
+    pub(crate) fn begin_atomic_batch(&mut self) {
+        self.commit_transaction();
+        self.coalescing_boundary = true;
+        self.atomic_batch = Some(Vec::new());
+    }
+
+    pub(crate) fn is_atomic_batch(&self) -> bool {
+        self.atomic_batch.is_some()
+    }
+
+    pub(crate) fn commit_atomic_batch(&mut self) {
+        let Some(changes) = self.atomic_batch.take() else {
+            return;
+        };
+        if changes.is_empty() {
+            return;
+        }
+        self.redo_transactions.clear();
+        if self.undo_transactions.len() >= MAX_UNDO_TRANSACTIONS {
+            self.undo_transactions.remove(0);
+        }
+        self.undo_transactions.push(UndoTransaction {
+            intent: EditIntent::Atomic,
+            changes,
+        });
+        self.coalescing_boundary = true;
     }
 
     /// Finish an atomic edit whose caret belongs inside the inserted text.
@@ -177,6 +213,7 @@ impl UndoManager {
         self.redo_transactions.clear();
         self.transaction_open = false;
         self.pending_change = None;
+        self.atomic_batch = None;
         self.pending_intent = None;
         self.coalescing_boundary = false;
     }
