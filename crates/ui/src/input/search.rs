@@ -12,7 +12,7 @@ use crate::{
     h_flex,
     input::{
         Enter, Escape, IndentInline, Input, InputBaseState, InputEvent, InputState, OutdentInline,
-        Replace,
+        Replace, Search,
     },
     label::Label,
     v_flex,
@@ -212,8 +212,16 @@ impl<M: crate::input::overlay::OverlayMode> SearchPanel<M> {
         focus_handle.focus(window, cx);
     }
 
-    fn on_action_replace(&mut self, _: &Replace, window: &mut Window, cx: &mut Context<Self>) {
-        self.toggle_replace_mode(window, cx);
+    fn on_action_search(&mut self, _: &Search, _: &mut Window, cx: &mut Context<Self>) {
+        let _ = self
+            .editor
+            .update(cx, |state, cx| state.refocus_search(false, cx));
+    }
+
+    fn on_action_replace(&mut self, _: &Replace, _: &mut Window, cx: &mut Context<Self>) {
+        let _ = self
+            .editor
+            .update(cx, |state, cx| state.refocus_search(true, cx));
     }
 
     /// Toggle the replace field, and move focus to the field that is going to be used.
@@ -303,6 +311,7 @@ impl<M: crate::input::overlay::OverlayMode> Render for SearchPanel<M> {
             .on_action(cx.listener(Self::on_action_tab))
             .on_action(cx.listener(Self::on_action_tab_prev))
             .on_action(cx.listener(Self::on_action_replace))
+            .on_action(cx.listener(Self::on_action_search))
             .font_family(cx.theme().font_family.clone())
             .items_center()
             .py_2()

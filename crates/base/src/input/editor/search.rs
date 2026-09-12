@@ -92,6 +92,21 @@ impl<M: InputModeKind> InputBaseState<M> {
         cx.notify();
     }
 
+    /// Focus an existing search session without reseeding it from the editor's
+    /// selection. Used when Find/Replace is invoked inside the search panel.
+    pub fn refocus_search(&mut self, replace_mode: bool, cx: &mut Context<Self>) {
+        if !self.searchable {
+            return;
+        }
+        if !self.search_session.open {
+            self.open_search(replace_mode, cx);
+            return;
+        }
+        self.search_session
+            .open(replace_mode, self.is_replaceable());
+        cx.notify();
+    }
+
     pub fn search_session(&self) -> &SearchSession {
         &self.search_session
     }
@@ -318,6 +333,7 @@ impl<M: InputModeKind> InputBaseState<M> {
 
     pub(super) fn on_action_search(&mut self, _: &Search, _: &mut Window, cx: &mut Context<Self>) {
         if !self.searchable {
+            cx.propagate();
             return;
         }
         self.open_search(false, cx);
@@ -330,6 +346,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         cx: &mut Context<Self>,
     ) {
         if !self.searchable {
+            cx.propagate();
             return;
         }
         self.open_search(true, cx);
@@ -373,12 +390,33 @@ impl SearchMatcher {
         }
         self.query_text = query.to_owned();
         self.case_insensitive = case_insensitive;
+        self.compile_query();
+    }
+
+    fn compile_query(&mut self) {
+        let query = &self.query_text;
         self.error = None;
         self.query = if query.is_empty() {
             None
         } else {
-            match RegexBuilder::new(&regex::escape(query))
-                .case_insensitive(case_insensitive)
+            let literal = regex::escape(query);
+            let pattern = if self.whole_word {
+                // Boundary assertions participate in candidate discovery, so
+                // an invalid overlapping candidate cannot consume a valid one.
+                // At a punctuation endpoint, non-boundary means its neighbor
+                // must also be a non-word character (or the document edge).
+                let boundary = |ch| if is_word_character(ch) { r"\b" } else { r"\B" };
+                format!(
+                    "{}{}{}",
+                    boundary(query.chars().next().unwrap()),
+                    literal,
+                    boundary(query.chars().next_back().unwrap())
+                )
+            } else {
+                literal
+            };
+            match RegexBuilder::new(&pattern)
+                .case_insensitive(self.case_insensitive)
                 .unicode(true)
                 .build()
             {
@@ -400,7 +438,7 @@ impl SearchMatcher {
             return;
         }
         self.whole_word = whole_word;
-        self.update_matches();
+        self.compile_query();
     }
 
     /// A failed query compilation clears matches and exposes a displayable error.
@@ -467,12 +505,7 @@ impl SearchMatcher {
         let mut ranges = Vec::new();
         if let Some(query) = &self.query {
             let text = self.text.to_string();
-            ranges.extend(
-                query
-                    .find_iter(&text)
-                    .map(|result| result.range())
-                    .filter(|range| !self.whole_word || whole_word_range(&text, range)),
-            );
+            ranges.extend(query.find_iter(&text).map(|result| result.range()));
         }
         self.matched_ranges = Rc::new(ranges);
         if !self.replacing || self.is_empty() {
@@ -484,17 +517,13 @@ impl SearchMatcher {
     }
 }
 
-fn whole_word_range(text: &str, range: &Range<usize>) -> bool {
+fn is_word_character(ch: char) -> bool {
     static WORD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\w").expect("valid word class"));
-    let is_word = |ch: char| {
-        if ch.is_ascii() {
-            ch.is_ascii_alphanumeric() || ch == '_'
-        } else {
-            WORD.is_match(ch.encode_utf8(&mut [0; 4]))
-        }
-    };
-    !text[..range.start].chars().next_back().is_some_and(is_word)
-        && !text[range.end..].chars().next().is_some_and(is_word)
+    if ch.is_ascii() {
+        ch.is_ascii_alphanumeric() || ch == '_'
+    } else {
+        WORD.is_match(ch.encode_utf8(&mut [0; 4]))
+    }
 }
 
 impl Iterator for SearchMatcher {
@@ -523,6 +552,15 @@ impl DoubleEndedIterator for SearchMatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn whole_word_rejected_candidate_does_not_hide_overlapping_match() {
+        let mut matcher = SearchMatcher::new();
+        matcher.update(&Rope::from("xa a a"));
+        matcher.update_query("a a", false);
+        matcher.set_whole_word(true);
+        assert_eq!(&*matcher.matched_ranges(), &[3..6]);
+    }
 
     #[test]
     fn whole_word_excludes_unicode_word_neighbors() {

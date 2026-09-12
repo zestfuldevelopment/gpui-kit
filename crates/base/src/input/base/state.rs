@@ -5456,6 +5456,49 @@ mod tests {
         assert_eq!(changes.get(), 3);
     }
 
+    #[gpui::test]
+    fn search_whole_word_replaces_overlapping_valid_match(cx: &mut TestAppContext) {
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        cx.update(|window, cx| {
+            view.input.update(cx, |state, cx| {
+                state.set_value("xa a a", window, cx);
+                state.set_search_query("a a", false, cx);
+                state.set_search_whole_word(true, cx);
+                assert_eq!(state.replace_all_search_matches("猫", window, cx), 1);
+                assert_eq!(state.value(), "xa 猫");
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.value(), "xa a a");
+                assert!(state.replace_current_search_match("é", window, cx));
+                assert_eq!(state.value(), "xa é");
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn search_refocus_retains_query_and_anchor(cx: &mut TestAppContext) {
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        cx.update(|window, cx| {
+            view.input.update(cx, |state, cx| {
+                state.set_value("foo bar", window, cx);
+                state.set_selected_range(0..3, cx);
+                state.open_search(false, cx);
+                state.set_search_query("bar", false, cx);
+                state.set_search_replacement("baz", cx);
+                let revision = state.search_session.focus_revision;
+                for replace_mode in [true, true, false] {
+                    state.refocus_search(replace_mode, cx);
+                    assert_eq!(state.search_session.query, "bar");
+                    assert_eq!(state.search_session.replacement, "baz");
+                    assert_eq!(state.search_session.anchor_offset, Some(0));
+                    assert_eq!(state.search_session.replace_mode, replace_mode);
+                }
+                assert_eq!(state.search_session.focus_revision, revision + 3);
+            })
+        });
+    }
+
     /// Unfolding at a position opens exactly the folds hiding it.
     ///
     /// A fold keeps its own first and last line visible, so a position on
