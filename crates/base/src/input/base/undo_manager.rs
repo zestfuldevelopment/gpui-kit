@@ -110,8 +110,10 @@ impl UndoManager {
         self.atomic_batch.is_some()
     }
 
-    pub(super) fn discard_atomic_batch(&mut self) {
-        self.atomic_batch = None;
+    pub(super) fn discard_atomic_batch(&mut self) -> Option<SelectionSnapshot> {
+        self.atomic_batch
+            .take()
+            .and_then(|batch| batch.selection_before)
     }
 
     pub(super) fn commit_atomic_batch(&mut self, selection_after: Option<SelectionSnapshot>) {

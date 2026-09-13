@@ -45,7 +45,8 @@ impl EditorState {
         self.selection_set.primary_id()
     }
 
-    /// Replace every selection with the same literal text as one undo operation.
+    /// Replace every selection with the same text as one undo operation.
+    /// Uses the same input normalization as ordinary replacement.
     /// Returns false for no text change, read-only/disabled state, or active IME.
     pub fn replace_selections(
         &mut self,
@@ -76,6 +77,10 @@ impl EditorState {
         if !self.is_editable() || self.ime_marked_range.is_some() {
             return false;
         }
+        // Inherited input options (such as the numeric mask) may change UTF-8
+        // byte length. Plan and compare against exactly the text the engine inserts.
+        let replacement = self.normalize_input(replacement);
+        let replacement = replacement.as_ref();
         let before = self.selection_snapshot();
         // Legacy scalar-range callers may have placed the primary inside a
         // cluster. Interactive multi-selection edits use outward grapheme clipping.

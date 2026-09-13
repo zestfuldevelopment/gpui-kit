@@ -2639,7 +2639,7 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// For number inputs (with [`MaskPattern::Number`]), this converts
     /// full-width number characters into their ASCII equivalents,
     /// e.g. `12。5` -> `12.5`.
-    fn normalize_input<'a>(&self, new_text: &'a str) -> Cow<'a, str> {
+    pub(super) fn normalize_input<'a>(&self, new_text: &'a str) -> Cow<'a, str> {
         let normalized = if matches!(self.mask_pattern, MaskPattern::Number { .. }) {
             normalize_number_input(new_text)
         } else {
@@ -3033,7 +3033,9 @@ impl<M: InputModeKind> InputBaseState<M> {
     ) {
         let final_selection = self.undo_manager.take_atomic_selection_after();
         if old_text == self.text {
-            self.undo_manager.discard_atomic_batch();
+            if let Some(before) = self.undo_manager.discard_atomic_batch() {
+                self.restore_selection_snapshot(before);
+            }
             return;
         }
         let range = 0..old_text.len();
@@ -3184,11 +3186,11 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         if !self.is_editable() {
             return;
         }
-        self.collapse_secondary_selections();
         let selections_before = (M::CODE_EDITOR
             && !self.undo_manager.is_atomic_batch()
             && !self.undo_manager.is_ignoring())
         .then(|| self.selection_snapshot());
+        self.collapse_secondary_selections();
         // A text edit invalidates the gesture's original word/line offsets.
         self.stop_mouse_selection();
         let selection_before = self.selected_range;

@@ -669,3 +669,138 @@ fn multi_selection_singleton_deletion_coalesces_with_affinity(cx: &mut TestAppCo
         })
         .unwrap();
 }
+
+#[gpui::test]
+fn multi_selection_indentation_batches_primary_and_restores_collection(cx: &mut TestAppContext) {
+    let view = InputView::new(cx);
+    view.window_handle
+        .update(cx, |_, window, cx| {
+            view.input.update(cx, |state, cx| {
+                for outdent in [false, true] {
+                    let (source, end, secondary, expected) = if outdent {
+                        ("  abc\n  xyz\nlast", 11, 12, "abc\nxyz\nlast")
+                    } else {
+                        ("abc\nxyz\nlast", 7, 8, "  abc\n  xyz\nlast")
+                    };
+                    state.set_value(source, window, cx);
+                    let before = vec![
+                        EditorSelection::new(7, end, 0)
+                            .with_line_end_affinity(true)
+                            .with_preferred_column(Some((px(17.), 4))),
+                        EditorSelection::new(8, secondary, secondary),
+                    ];
+                    state.set_selections(before.clone(), 7, cx);
+                    if outdent {
+                        state.outdent(true, window, cx);
+                    } else {
+                        state.indent(true, window, cx);
+                    }
+                    let after = state.selections();
+                    assert_eq!(state.value(), expected);
+                    assert_eq!(after.len(), 1);
+                    state.undo(&Undo, window, cx);
+                    assert_eq!(state.value(), source);
+                    assert_eq!(state.selections(), before);
+                    assert!(!state.undo_manager.has_undos());
+                    state.redo(&Redo, window, cx);
+                    assert_eq!(state.value(), expected);
+                    assert_eq!(state.selections(), after);
+                }
+                state.set_value("abc\nxyz", window, cx);
+                let before = vec![EditorSelection::new(7, 3, 0), EditorSelection::new(8, 4, 4)];
+                state.set_selections(before.clone(), 7, cx);
+                state.replace_selections("X", window, cx);
+                let after = state.selections();
+                let value = state.value();
+                state.undo(&Undo, window, cx);
+                state.outdent(true, window, cx);
+                assert_eq!(state.selections(), before);
+                assert_eq!(state.value(), "abc\nxyz");
+                assert!(!state.undo_manager.has_undos());
+                state.set_readonly(true, cx);
+                state.indent(true, window, cx);
+                assert_eq!(state.selections(), before);
+                state.set_readonly(false, cx);
+                state.redo(&Redo, window, cx);
+                assert_eq!(state.value(), value);
+                assert_eq!(state.selections(), after);
+            })
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn multi_selection_ime_primary_commit_and_cancellation_history(cx: &mut TestAppContext) {
+    let view = InputView::new(cx);
+    view.window_handle
+        .update(cx, |_, window, cx| {
+            view.input.update(cx, |state, cx| {
+                state.set_value("abcd", window, cx);
+                let before = vec![
+                    EditorSelection::new(1, 0, 1),
+                    EditorSelection::new(2, 3, 2)
+                        .with_line_end_affinity(true)
+                        .with_preferred_column(Some((px(7.), 2))),
+                ];
+                state.set_selections(before.clone(), 2, cx);
+                state.replace_and_mark_text_in_range(None, "q", Some(1..1), window, cx);
+                state.replace_text_in_range(None, "Q", window, cx);
+                let after = state.selections();
+                assert_eq!(state.value(), "abQd");
+                assert_eq!(after.len(), 1);
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.value(), "abcd");
+                assert_eq!(state.selections(), before);
+                state.redo(&Redo, window, cx);
+                assert_eq!(state.value(), "abQd");
+                assert_eq!(state.selections(), after);
+                state.undo(&Undo, window, cx);
+                state.set_selections(
+                    vec![EditorSelection::new(1, 0, 0), EditorSelection::new(2, 2, 2)],
+                    2,
+                    cx,
+                );
+                state.replace_and_mark_text_in_range(None, "q", Some(1..1), window, cx);
+                state.replace_and_mark_text_in_range(None, "", None, window, cx);
+                assert_eq!(state.value(), "abcd");
+                assert!(!state.undo_manager.has_undos());
+                state.redo(&Redo, window, cx);
+                assert_eq!(state.value(), "abQd");
+                assert_eq!(state.selections(), after);
+            })
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn multi_selection_numeric_normalization_plans_same_bytes_and_noops(cx: &mut TestAppContext) {
+    let view = InputView::new(cx);
+    view.window_handle
+        .update(cx, |_, window, cx| {
+            view.input.update(cx, |state, cx| {
+                state.set_value("a b", window, cx);
+                let before = vec![EditorSelection::new(1, 0, 1), EditorSelection::new(2, 2, 3)];
+                state.set_selections(before.clone(), 2, cx);
+                state.ensure_number_mask();
+                assert!(state.replace_selections("１", window, cx));
+                assert_eq!(state.value(), "1 1");
+                let after = vec![EditorSelection::new(1, 1, 1), EditorSelection::new(2, 3, 3)];
+                assert_eq!(state.selections(), after);
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.value(), "a b");
+                assert_eq!(state.selections(), before);
+                state.redo(&Redo, window, cx);
+                assert_eq!(state.selections(), after);
+                state.set_selections(before.clone(), 2, cx);
+                state.replace_selections("2", window, cx);
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.value(), "1 1");
+                let before_noop = state.selections();
+                assert!(!state.replace_selections("１", window, cx));
+                assert_eq!(state.selections(), before_noop);
+                state.redo(&Redo, window, cx);
+                assert_eq!(state.value(), "2 2");
+            })
+        })
+        .unwrap();
+}
