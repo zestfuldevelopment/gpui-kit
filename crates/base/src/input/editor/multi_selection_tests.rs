@@ -804,3 +804,54 @@ fn multi_selection_numeric_normalization_plans_same_bytes_and_noops(cx: &mut Tes
         })
         .unwrap();
 }
+
+#[gpui::test]
+fn multi_selection_history_replays_recorded_bytes_without_normalization(cx: &mut TestAppContext) {
+    let view = InputView::new(cx);
+    view.window_handle
+        .update(cx, |_, window, cx| {
+            view.input.update(cx, |state, cx| {
+                state.set_value("１ a", window, cx);
+                let before = vec![EditorSelection::new(1, 0, 3), EditorSelection::new(2, 5, 4)];
+                state.set_selections(before.clone(), 2, cx);
+                state.ensure_number_mask();
+                assert!(state.replace_selections("2", window, cx));
+                let after = state.selections();
+                assert_eq!(state.value(), "2 2");
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.value(), "１ a");
+                assert_eq!(state.selections(), before);
+                state.redo(&Redo, window, cx);
+                assert_eq!(state.value(), "2 2");
+                assert_eq!(state.selections(), after);
+                // set_value also ignores history, but still applies ordinary normalization.
+                state.set_value("４ ５", window, cx);
+                assert_eq!(state.value(), "4 5");
+            })
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn multi_selection_history_ignores_normalizer_changes_after_edit(cx: &mut TestAppContext) {
+    let view = InputView::new(cx);
+    view.window_handle
+        .update(cx, |_, window, cx| {
+            view.input.update(cx, |state, cx| {
+                state.set_value("１ a", window, cx);
+                let before = vec![EditorSelection::new(1, 0, 3), EditorSelection::new(2, 4, 5)];
+                state.set_selections(before.clone(), 2, cx);
+                assert!(state.replace_selections("３", window, cx));
+                let after = state.selections();
+                assert_eq!(state.value(), "３ ３");
+                state.ensure_number_mask();
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.value(), "１ a");
+                assert_eq!(state.selections(), before);
+                state.redo(&Redo, window, cx);
+                assert_eq!(state.value(), "３ ３");
+                assert_eq!(state.selections(), after);
+            })
+        })
+        .unwrap();
+}

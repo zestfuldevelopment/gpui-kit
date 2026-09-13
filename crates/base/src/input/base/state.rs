@@ -122,6 +122,12 @@ pub enum InputEvent {
     Blur,
 }
 
+/// History must retain recorded bytes when input normalization options change.
+enum ReplacementSource {
+    Input,
+    History,
+}
+
 pub(super) const CONTEXT: &str = "Input";
 
 pub(crate) fn init(cx: &mut App) {
@@ -2169,7 +2175,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             }
             for change in &changes {
                 let range_utf16 = self.range_to_utf16(&change.new_range.into());
-                self.replace_text_in_range_silent(Some(range_utf16), &change.old_text, window, cx);
+                self.replay_text_in_range(range_utf16, &change.old_text, window, cx);
             }
             self.selected_range = selection;
             self.selection_reversed = reversed;
@@ -2194,7 +2200,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             }
             for change in &changes {
                 let range_utf16 = self.range_to_utf16(&change.old_range.into());
-                self.replace_text_in_range_silent(Some(range_utf16), &change.new_text, window, cx);
+                self.replay_text_in_range(range_utf16, &change.new_text, window, cx);
             }
             self.selected_range = selection;
             self.selection_reversed = reversed;
@@ -2784,6 +2790,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         &mut self,
         range_utf16: Option<Range<usize>>,
         new_text: &str,
+        source: ReplacementSource,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
@@ -2822,7 +2829,10 @@ impl<M: InputModeKind> InputBaseState<M> {
         // NOTE: The normalization keeps the UTF-16 length, but may change the
         // UTF-8 byte length, so all the byte-offset calculations below must
         // use the normalized text.
-        let mut new_text = self.normalize_input(new_text);
+        let mut new_text = match source {
+            ReplacementSource::Input => self.normalize_input(new_text),
+            ReplacementSource::History => Cow::Borrowed(new_text),
+        };
 
         let mut range = range_utf16
             .as_ref()
@@ -3007,9 +3017,36 @@ impl<M: InputModeKind> InputBaseState<M> {
         cx: &mut Context<Self>,
     ) -> bool {
         self.silent_replace_text = true;
-        let accepted = self.apply_text_replacement(range_utf16, new_text, window, cx);
+        let accepted = self.apply_text_replacement(
+            range_utf16,
+            new_text,
+            ReplacementSource::Input,
+            window,
+            cx,
+        );
         self.silent_replace_text = false;
         accepted
+    }
+
+    /// Replay the recorded payload without applying current input normalization.
+    /// This is deliberately separate from ignoring history: set_value ignores
+    /// history too, but still accepts and normalizes ordinary input.
+    fn replay_text_in_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.silent_replace_text = true;
+        self.apply_text_replacement(
+            Some(range_utf16),
+            text,
+            ReplacementSource::History,
+            window,
+            cx,
+        );
+        self.silent_replace_text = false;
     }
 
     /// Capture the selection collection once for any localized editor batch.
@@ -3170,7 +3207,7 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.apply_text_replacement(range_utf16, new_text, window, cx);
+        self.apply_text_replacement(range_utf16, new_text, ReplacementSource::Input, window, cx);
     }
 
     /// Mark text is the IME temporary insert on typing.
