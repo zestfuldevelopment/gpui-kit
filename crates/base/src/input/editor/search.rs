@@ -303,7 +303,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             );
             return if accepted { ranges.len() } else { 0 };
         }
-        self.undo_manager.begin_atomic_batch();
+        self.begin_atomic_edit_batch(None);
         // Reverse order keeps each saved byte range valid. Each edit uses the
         // normal UTF-16 input/history path and adjusts only overlapping folds.
         for range in ranges.iter().rev() {

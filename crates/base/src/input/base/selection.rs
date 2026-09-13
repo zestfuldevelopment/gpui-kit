@@ -32,6 +32,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             range
         };
 
+        self.collapse_secondary_selections();
         self.undo_manager.break_transaction_coalescing();
         self.selected_range = (range.start..range.end).into();
         self.selection_reversed = false;
@@ -44,6 +45,7 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// The offset is the UTF-8 offset.
     pub(super) fn select_line(&mut self, offset: usize, _: &mut Window, cx: &mut Context<Self>) {
         let range = TextSelector::line_range(&self.text, offset);
+        self.collapse_secondary_selections();
         self.undo_manager.break_transaction_coalescing();
         self.selected_range = (range.start..range.end).into();
         self.selection_reversed = false;

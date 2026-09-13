@@ -111,8 +111,9 @@ impl EditorState {
         );
         self.selected_range = after;
         self.selection_reversed = reversed;
-        self.undo_manager.set_last_selection_after(after, reversed);
         self.update_preferred_column();
+        self.undo_manager
+            .set_last_selection_after(after, reversed, self.selection_snapshot());
         self.scroll_to(self.cursor(), None, cx);
         cx.notify();
     }

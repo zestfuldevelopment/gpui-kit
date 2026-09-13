@@ -64,6 +64,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         line_end_affinity: bool,
         cx: &mut Context<Self>,
     ) {
+        self.collapse_secondary_selections();
         self.undo_manager.break_transaction_coalescing();
         let offset = offset.clamp(0, self.text.len());
         self.cursor_line_end_affinity = line_end_affinity;

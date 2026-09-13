@@ -236,6 +236,8 @@ impl<M: InputModeKind> InputBaseState<M> {
             return;
         };
 
+        // Indentation retains its existing single-selection command behavior.
+        self.collapse_secondary_selections();
         let tab_indent = self.mode.tab_size().to_string();
         let selected_range = self.selected_range;
         let mut added_len = 0;
@@ -294,6 +296,8 @@ impl<M: InputModeKind> InputBaseState<M> {
             return;
         };
 
+        // Indentation retains its existing single-selection command behavior.
+        self.collapse_secondary_selections();
         let tab_indent = self.mode.tab_size().to_string();
         let selected_range = self.selected_range;
         let mut removed_len = 0;

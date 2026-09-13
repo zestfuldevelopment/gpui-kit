@@ -19,7 +19,7 @@ pub use gpui_base::input::{
     CompletionMenuOptions, CompletionProvider, Copy, Cut, DefinitionProvider, Delete,
     DeleteToBeginningOfLine, DeleteToEndOfLine, DeleteToNextWordEnd, DeleteToPreviousWordStart,
     DisplayMap, DisplayPoint, DocumentColorProvider, DocumentRangeSemanticTokensProvider,
-    EditorState, Enter, Escape, FoldRange, GoToDefinition, HighlightStyleResolver,
+    EditorSelection, EditorState, Enter, Escape, FoldRange, GoToDefinition, HighlightStyleResolver,
     HoverPopoverState, HoverProvider, Indent, IndentInline, InputEdit, InputEvent,
     InputHighlighter, InputHighlighterFactory, InputState, Lsp, MaskPattern, MoveDown, MoveEnd,
     MoveHome, MoveLeft, MovePageDown, MovePageUp, MoveRight, MoveToEnd, MoveToEndOfLine,

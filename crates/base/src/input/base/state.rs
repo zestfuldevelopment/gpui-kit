@@ -312,6 +312,7 @@ pub struct InputBaseState<M: InputModeKind> {
     /// - "Hello 世界💝" = 16
     /// - "💝" = 4
     pub(super) selected_range: Selection,
+    pub(super) selection_set: super::selection_set::SelectionSet,
     /// Initial word or line anchor for the active pointer gesture.
     pub(super) mouse_selection: Option<MouseSelection>,
     pub(super) selection_reversed: bool,
@@ -637,6 +638,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             blink_cursor,
             undo_manager,
             selected_range: Selection::default(),
+            selection_set: Default::default(),
             mouse_selection: None,
             selection_reversed: false,
             ime_marked_range: None,
@@ -943,6 +945,7 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     fn reset_selection(&mut self) {
+        self.collapse_secondary_selections();
         // For single-line inputs the caret is placed at the end of the text
         // (matching HTML `<input>`); multi-line inputs reset the selection to
         // `0..0`.
@@ -1686,10 +1689,14 @@ impl<M: InputModeKind> InputBaseState<M> {
                 let range_utf16 = self.range_to_utf16(&replacement);
                 self.undo_manager.break_transaction_coalescing();
                 self.replace_text_in_range_silent(Some(range_utf16), &new_line_text, window, cx);
-                if changed {
-                    self.undo_manager.set_last_caret_after(caret);
-                }
                 self.move_to(caret, None, cx);
+                if changed {
+                    self.undo_manager.set_last_selection_after(
+                        (caret..caret).into(),
+                        false,
+                        self.selection_snapshot(),
+                    );
+                }
             } else {
                 let new_line_text = format!("{line_break}{indent}");
                 // A marked IME range still owns replacement ahead of its caret.
@@ -1756,6 +1763,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             return;
         }
 
+        self.collapse_secondary_selections();
         if !self.selected_range.contains(offset) {
             self.move_to(offset, None, cx);
         }
@@ -1778,6 +1786,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.collapse_secondary_selections();
         self.undo_manager.break_transaction_coalescing();
         // Input has its own text selection; suppress the window-level text
         // selection (Root) so it does not start a drag from here.
@@ -1849,7 +1858,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.stop_mouse_selection();
     }
 
-    fn stop_mouse_selection(&mut self) {
+    pub(super) fn stop_mouse_selection(&mut self) {
         self.selecting = false;
         self.mouse_selection = None;
         self.auto_scroll.stop();
@@ -2144,7 +2153,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             let reversed = changes.last().unwrap().selection_before_reversed;
             let old_text = self.text.clone();
             if changes.len() > 1 {
-                self.undo_manager.begin_atomic_batch();
+                self.begin_atomic_edit_batch(None);
             }
             for change in &changes {
                 let range_utf16 = self.range_to_utf16(&change.new_range.into());
@@ -2154,6 +2163,9 @@ impl<M: InputModeKind> InputBaseState<M> {
             self.selection_reversed = reversed;
             if changes.len() > 1 {
                 self.finish_atomic_edit_batch(old_text, window, cx);
+            }
+            if let Some(snapshot) = self.undo_manager.take_replay_selection() {
+                self.restore_selection_snapshot(snapshot);
             }
         }
         self.undo_manager.set_ignoring(false);
@@ -2166,7 +2178,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             let reversed = changes.last().unwrap().selection_after_reversed;
             let old_text = self.text.clone();
             if changes.len() > 1 {
-                self.undo_manager.begin_atomic_batch();
+                self.begin_atomic_edit_batch(None);
             }
             for change in &changes {
                 let range_utf16 = self.range_to_utf16(&change.old_range.into());
@@ -2176,6 +2188,9 @@ impl<M: InputModeKind> InputBaseState<M> {
             self.selection_reversed = reversed;
             if changes.len() > 1 {
                 self.finish_atomic_edit_batch(old_text, window, cx);
+            }
+            if let Some(snapshot) = self.undo_manager.take_replay_selection() {
+                self.restore_selection_snapshot(snapshot);
             }
         }
         self.undo_manager.set_ignoring(false);
@@ -2229,6 +2244,7 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     pub fn select_all(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        self.collapse_secondary_selections();
         self.undo_manager.break_transaction_coalescing();
         self.selected_range = (0..self.text.len()).into();
         cx.notify();
@@ -2362,6 +2378,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         line_end_affinity: bool,
         cx: &mut Context<Self>,
     ) {
+        self.collapse_secondary_selections();
         M::clear_inline_completion(self, cx);
 
         self.cursor_line_end_affinity = line_end_affinity;
@@ -2385,6 +2402,7 @@ impl<M: InputModeKind> InputBaseState<M> {
 
     /// Unselects the currently selected text.
     pub fn unselect(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        self.collapse_secondary_selections();
         self.undo_manager.break_transaction_coalescing();
         let offset = self.cursor();
         self.selected_range = (offset..offset).into();
@@ -2761,6 +2779,13 @@ impl<M: InputModeKind> InputBaseState<M> {
         if !self.is_editable() {
             return false;
         }
+        let owns_batch = !self.undo_manager.is_atomic_batch()
+            && !self.undo_manager.is_ignoring()
+            && self.selection_set.has_secondary();
+        if owns_batch {
+            self.begin_atomic_edit_batch(None);
+        }
+        self.collapse_secondary_selections();
         // A text edit invalidates the gesture's original word/line offsets.
         self.stop_mouse_selection();
         let selection_before = self.selected_range;
@@ -2902,6 +2927,12 @@ impl<M: InputModeKind> InputBaseState<M> {
         if self.undo_manager.is_atomic_batch() {
             self.selected_range = (new_offset..new_offset).into();
             self.ime_marked_range.take();
+            if owns_batch {
+                self.finish_atomic_edit_batch(old_text, window, cx);
+                if !self.silent_replace_text {
+                    M::on_text_typed(self, &range, new_text, window, cx);
+                }
+            }
             return true;
         }
         if let Some(diagnostics) = self.mode.diagnostics_mut() {
@@ -2957,6 +2988,16 @@ impl<M: InputModeKind> InputBaseState<M> {
         accepted
     }
 
+    /// Capture the selection collection once for any localized editor batch.
+    pub(super) fn begin_atomic_edit_batch(
+        &mut self,
+        planned_before: Option<super::selection_set::SelectionSnapshot>,
+    ) {
+        let before = (M::CODE_EDITOR && !self.undo_manager.is_ignoring())
+            .then(|| planned_before.unwrap_or_else(|| self.selection_snapshot()));
+        self.undo_manager.begin_atomic_batch(before);
+    }
+
     /// Publish a completed batch after each edit has adjusted folds and history.
     /// A whole-text refresh here does not perform a whole-text edit: closed
     /// sibling folds keep the coordinates established by the individual edits.
@@ -2966,8 +3007,9 @@ impl<M: InputModeKind> InputBaseState<M> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.undo_manager.commit_atomic_batch();
+        let final_selection = self.undo_manager.take_atomic_selection_after();
         if old_text == self.text {
+            self.undo_manager.discard_atomic_batch();
             return;
         }
         let range = 0..old_text.len();
@@ -2990,6 +3032,12 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.update_fold_candidates();
         M::refresh_language_features(self, window, cx);
         self.update_preferred_column();
+        if let Some(snapshot) = final_selection {
+            self.restore_selection_snapshot(snapshot);
+        }
+        let after =
+            (M::CODE_EDITOR && !self.undo_manager.is_ignoring()).then(|| self.selection_snapshot());
+        self.undo_manager.commit_atomic_batch(after);
         self.update_search(cx);
         if self.is_multi_line() {
             self.mode.update_auto_grow(&self.display_map);
@@ -3112,6 +3160,7 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         if !self.is_editable() {
             return;
         }
+        self.collapse_secondary_selections();
         // A text edit invalidates the gesture's original word/line offsets.
         self.stop_mouse_selection();
         let selection_before = self.selected_range;
@@ -3425,6 +3474,7 @@ impl<M: InputModeKind> Render for InputBaseState<M> {
 #[cfg(test)]
 mod tests {
     include!("grapheme_tests.rs");
+    include!("../editor/multi_selection_tests.rs");
     include!("mouse_selection_tests.rs");
 
     use super::*;

@@ -1,4 +1,4 @@
-use crate::input::change::Change;
+use crate::input::{change::Change, selection_set::SelectionSnapshot};
 
 const MAX_UNDO_TRANSACTIONS: usize = 1000;
 const MAX_CHANGES_PER_TRANSACTION: usize = 1000;
@@ -15,6 +15,14 @@ pub(crate) enum EditIntent {
 struct UndoTransaction {
     intent: EditIntent,
     changes: Vec<Change>,
+    selections: Option<(SelectionSnapshot, SelectionSnapshot)>,
+}
+
+#[derive(Debug)]
+struct AtomicBatch {
+    changes: Vec<Change>,
+    selection_before: Option<SelectionSnapshot>,
+    selection_after: Option<SelectionSnapshot>,
 }
 
 /// Coordinates undo and redo as explicit editing transactions.
@@ -28,10 +36,11 @@ struct UndoTransaction {
 pub(crate) struct UndoManager {
     undo_transactions: Vec<UndoTransaction>,
     redo_transactions: Vec<UndoTransaction>,
+    replay_selection: Option<SelectionSnapshot>,
     ignoring: bool,
     transaction_open: bool,
     pending_change: Option<Change>,
-    atomic_batch: Option<Vec<Change>>,
+    atomic_batch: Option<AtomicBatch>,
     pub(crate) pending_intent: Option<EditIntent>,
     coalescing_boundary: bool,
 }
@@ -41,6 +50,7 @@ impl UndoManager {
         Self {
             undo_transactions: Vec::new(),
             redo_transactions: Vec::new(),
+            replay_selection: None,
             ignoring: false,
             transaction_open: false,
             pending_change: None,
@@ -54,9 +64,9 @@ impl UndoManager {
         if self.ignoring {
             return;
         }
-        if let Some(changes) = self.atomic_batch.as_mut() {
+        if let Some(batch) = self.atomic_batch.as_mut() {
             if change.old_range != change.new_range || change.old_text != change.new_text {
-                changes.push(change);
+                batch.changes.push(change);
             }
         } else if self.transaction_open {
             // Identical IME callbacks still belong to the open composition.
@@ -78,21 +88,29 @@ impl UndoManager {
 
     /// Group disjoint replacements without the IME transaction's single-range
     /// merging. Every change retains its normal selection and byte boundaries.
-    pub(crate) fn begin_atomic_batch(&mut self) {
+    pub(super) fn begin_atomic_batch(&mut self, selection_before: Option<SelectionSnapshot>) {
         self.commit_transaction();
         self.coalescing_boundary = true;
-        self.atomic_batch = Some(Vec::new());
+        self.atomic_batch = Some(AtomicBatch {
+            changes: Vec::new(),
+            selection_before,
+            selection_after: None,
+        });
     }
 
     pub(crate) fn is_atomic_batch(&self) -> bool {
         self.atomic_batch.is_some()
     }
 
-    pub(crate) fn commit_atomic_batch(&mut self) {
-        let Some(changes) = self.atomic_batch.take() else {
+    pub(super) fn discard_atomic_batch(&mut self) {
+        self.atomic_batch = None;
+    }
+
+    pub(super) fn commit_atomic_batch(&mut self, selection_after: Option<SelectionSnapshot>) {
+        let Some(batch) = self.atomic_batch.take() else {
             return;
         };
-        if changes.is_empty() {
+        if batch.changes.is_empty() {
             return;
         }
         self.redo_transactions.clear();
@@ -101,43 +119,47 @@ impl UndoManager {
         }
         self.undo_transactions.push(UndoTransaction {
             intent: EditIntent::Atomic,
-            changes,
+            changes: batch.changes,
+            selections: batch.selection_before.zip(selection_after),
         });
         self.coalescing_boundary = true;
     }
 
-    /// Finish an atomic edit whose caret belongs inside the inserted text.
-    pub(super) fn set_last_caret_after(&mut self, offset: usize) {
-        if self.ignoring {
-            return;
-        }
-        if let Some(change) = self
-            .undo_transactions
-            .last_mut()
-            .and_then(|t| t.changes.last_mut())
-        {
-            change.selection_after = (offset..offset).into();
-            change.selection_after_reversed = false;
-        }
-    }
-
-    /// Record the final selection of a completed, nonempty atomic replacement.
+    /// Record the final selection after a completed, nonempty command adjusts
+    /// its caret. Full transaction snapshots and legacy history stay in sync.
     pub(super) fn set_last_selection_after(
         &mut self,
         selection: crate::input::Selection,
         reversed: bool,
+        after: SelectionSnapshot,
     ) {
         if self.ignoring {
             return;
         }
-        if let Some(change) = self
-            .undo_transactions
-            .last_mut()
-            .and_then(|t| t.changes.last_mut())
-        {
-            change.selection_after = selection;
-            change.selection_after_reversed = reversed;
+        if let Some(transaction) = self.undo_transactions.last_mut() {
+            if let Some(change) = transaction.changes.last_mut() {
+                change.selection_after = selection;
+                change.selection_after_reversed = reversed;
+            }
+            if let Some((_, selection_after)) = transaction.selections.as_mut() {
+                *selection_after = after;
+            }
         }
+    }
+
+    /// Supply the planned final editor selections while the batch is still open.
+    pub(super) fn set_atomic_selection_after(&mut self, after: SelectionSnapshot) {
+        if let Some(batch) = self.atomic_batch.as_mut() {
+            batch.selection_after = Some(after);
+        }
+    }
+
+    pub(super) fn take_atomic_selection_after(&mut self) -> Option<SelectionSnapshot> {
+        self.atomic_batch.as_mut()?.selection_after.take()
+    }
+
+    pub(super) fn take_replay_selection(&mut self) -> Option<SelectionSnapshot> {
+        self.replay_selection.take()
     }
 
     pub(super) fn begin_transaction(&mut self) {
@@ -188,6 +210,7 @@ impl UndoManager {
         self.undo_transactions.push(UndoTransaction {
             intent,
             changes: vec![change],
+            selections: None,
         });
         self.coalescing_boundary = intent == EditIntent::Atomic;
     }
@@ -209,6 +232,7 @@ impl UndoManager {
     }
 
     pub(super) fn clear(&mut self) {
+        self.replay_selection = None;
         self.undo_transactions.clear();
         self.redo_transactions.clear();
         self.transaction_open = false;
@@ -220,7 +244,12 @@ impl UndoManager {
 
     pub(super) fn undo(&mut self) -> Option<Vec<Change>> {
         self.commit_transaction();
+        self.replay_selection = None;
         let transaction = self.undo_transactions.pop()?;
+        self.replay_selection = transaction
+            .selections
+            .as_ref()
+            .map(|(before, _)| before.clone());
         let changes = transaction.changes.iter().rev().cloned().collect();
         self.redo_transactions.push(transaction);
         self.coalescing_boundary = true;
@@ -229,7 +258,12 @@ impl UndoManager {
 
     pub(super) fn redo(&mut self) -> Option<Vec<Change>> {
         self.commit_transaction();
+        self.replay_selection = None;
         let transaction = self.redo_transactions.pop()?;
+        self.replay_selection = transaction
+            .selections
+            .as_ref()
+            .map(|(_, after)| after.clone());
         let changes = transaction.changes.clone();
         self.undo_transactions.push(transaction);
         self.coalescing_boundary = true;

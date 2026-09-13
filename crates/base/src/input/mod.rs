@@ -57,6 +57,8 @@ mod rope_ext;
 mod search;
 #[path = "base/selection.rs"]
 mod selection;
+#[path = "base/selection_set.rs"]
+mod selection_set;
 #[path = "base/state.rs"]
 mod state;
 mod textarea;
@@ -102,5 +104,6 @@ pub use native::{NativeMenu, NativeMenuItem};
 pub use rope_ext::{InputEdit, Point, RopeExt, RopeLines};
 pub use ropey::Rope;
 pub use search::{SearchMatcher, SearchSession};
+pub use selection_set::EditorSelection;
 pub use state::*;
 pub use textarea::{Textarea, TextareaState};

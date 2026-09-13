@@ -1,3 +1,5 @@
+mod multi_selection;
+
 use gpui::{App, Div, Entity, InteractiveElement as _, IntoElement, RenderOnce, Stateful, Window};
 
 use super::{EditorMode, InputBaseState, InputModeKind};
