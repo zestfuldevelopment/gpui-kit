@@ -40,6 +40,7 @@ pub(crate) struct UndoManager {
     ignoring: bool,
     transaction_open: bool,
     pending_change: Option<Change>,
+    pending_selections: Option<(SelectionSnapshot, SelectionSnapshot)>,
     atomic_batch: Option<AtomicBatch>,
     pub(crate) pending_intent: Option<EditIntent>,
     coalescing_boundary: bool,
@@ -54,13 +55,19 @@ impl UndoManager {
             ignoring: false,
             transaction_open: false,
             pending_change: None,
+            pending_selections: None,
             atomic_batch: None,
             pending_intent: None,
             coalescing_boundary: false,
         }
     }
 
-    pub(super) fn record_transaction(&mut self, change: Change, intent: EditIntent) {
+    pub(super) fn record_transaction(
+        &mut self,
+        change: Change,
+        intent: EditIntent,
+        selections: Option<(SelectionSnapshot, SelectionSnapshot)>,
+    ) {
         if self.ignoring {
             return;
         }
@@ -69,6 +76,7 @@ impl UndoManager {
                 batch.changes.push(change);
             }
         } else if self.transaction_open {
+            merge_selection_snapshots(&mut self.pending_selections, selections);
             // Identical IME callbacks still belong to the open composition.
             // Committing the transaction discards any net-zero change.
             if let Some(pending) = self.pending_change.as_mut() {
@@ -82,7 +90,7 @@ impl UndoManager {
         } else if change.old_range == change.new_range && change.old_text == change.new_text {
             self.break_transaction_coalescing();
         } else {
-            self.push_transaction(change, intent);
+            self.push_transaction(change, intent, selections);
         }
     }
 
@@ -168,6 +176,7 @@ impl UndoManager {
         }
         self.transaction_open = true;
         self.pending_change = None;
+        self.pending_selections = None;
     }
 
     pub(super) fn commit_transaction(&mut self) {
@@ -175,14 +184,20 @@ impl UndoManager {
             return;
         }
         self.transaction_open = false;
+        let selections = self.pending_selections.take();
         if let Some(change) = self.pending_change.take()
             && (change.old_range != change.new_range || change.old_text != change.new_text)
         {
-            self.push_transaction(change, EditIntent::Atomic);
+            self.push_transaction(change, EditIntent::Atomic, selections);
         }
     }
 
-    fn push_transaction(&mut self, change: Change, intent: EditIntent) {
+    fn push_transaction(
+        &mut self,
+        change: Change,
+        intent: EditIntent,
+        selections: Option<(SelectionSnapshot, SelectionSnapshot)>,
+    ) {
         self.redo_transactions.clear();
         let can_coalesce = !self.coalescing_boundary
             && intent != EditIntent::Atomic
@@ -196,11 +211,12 @@ impl UndoManager {
             });
 
         if can_coalesce {
-            self.undo_transactions
+            let transaction = self
+                .undo_transactions
                 .last_mut()
-                .expect("coalescing requires a previous transaction")
-                .changes
-                .push(change);
+                .expect("coalescing requires a previous transaction");
+            transaction.changes.push(change);
+            merge_selection_snapshots(&mut transaction.selections, selections);
             return;
         }
 
@@ -210,7 +226,7 @@ impl UndoManager {
         self.undo_transactions.push(UndoTransaction {
             intent,
             changes: vec![change],
-            selections: None,
+            selections,
         });
         self.coalescing_boundary = intent == EditIntent::Atomic;
     }
@@ -237,6 +253,7 @@ impl UndoManager {
         self.redo_transactions.clear();
         self.transaction_open = false;
         self.pending_change = None;
+        self.pending_selections = None;
         self.atomic_batch = None;
         self.pending_intent = None;
         self.coalescing_boundary = false;
@@ -273,6 +290,20 @@ impl UndoManager {
     #[cfg(test)]
     pub(super) fn has_undos(&self) -> bool {
         !self.undo_transactions.is_empty()
+    }
+}
+
+/// Coalescing and IME retain the original selection and the latest result.
+fn merge_selection_snapshots(
+    target: &mut Option<(SelectionSnapshot, SelectionSnapshot)>,
+    next: Option<(SelectionSnapshot, SelectionSnapshot)>,
+) {
+    if let Some((before, after)) = next {
+        if let Some((_, previous_after)) = target.as_mut() {
+            *previous_after = after;
+        } else {
+            *target = Some((before, after));
+        }
     }
 }
 
@@ -319,8 +350,8 @@ mod tests {
     #[test]
     fn adjacent_typing_transactions_coalesce() {
         let mut manager = UndoManager::new();
-        manager.record_transaction(typing_change(0, "a"), EditIntent::Typing);
-        manager.record_transaction(typing_change(1, "b"), EditIntent::Typing);
+        manager.record_transaction(typing_change(0, "a"), EditIntent::Typing, None);
+        manager.record_transaction(typing_change(1, "b"), EditIntent::Typing, None);
 
         assert_eq!(manager.undo().unwrap().len(), 2);
         assert!(manager.undo().is_none());
@@ -330,8 +361,8 @@ mod tests {
     fn explicit_transaction_collects_multiple_changes() {
         let mut manager = UndoManager::new();
         manager.begin_transaction();
-        manager.record_transaction(typing_change(0, "a"), EditIntent::Typing);
-        manager.record_transaction(typing_change(0, "ab"), EditIntent::Typing);
+        manager.record_transaction(typing_change(0, "a"), EditIntent::Typing, None);
+        manager.record_transaction(typing_change(0, "ab"), EditIntent::Typing, None);
         manager.commit_transaction();
 
         let transaction = manager.undo().unwrap();
@@ -344,7 +375,7 @@ mod tests {
         let mut manager = UndoManager::new();
 
         for offset in 0..1_100 {
-            manager.record_transaction(typing_change(offset, "a"), EditIntent::Atomic);
+            manager.record_transaction(typing_change(offset, "a"), EditIntent::Atomic, None);
         }
 
         for _ in 0..MAX_UNDO_TRANSACTIONS {
@@ -358,7 +389,7 @@ mod tests {
         let mut manager = UndoManager::new();
 
         for offset in 0..1_100 {
-            manager.record_transaction(typing_change(offset, "a"), EditIntent::Typing);
+            manager.record_transaction(typing_change(offset, "a"), EditIntent::Typing, None);
         }
 
         assert_eq!(manager.undo().unwrap().len(), 100);

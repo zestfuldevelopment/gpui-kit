@@ -238,6 +238,7 @@ impl<M: InputModeKind> InputBaseState<M> {
 
         // Indentation retains its existing single-selection command behavior.
         self.collapse_secondary_selections();
+        let original_len = self.text.len();
         let tab_indent = self.mode.tab_size().to_string();
         let selected_range = self.selected_range;
         let mut added_len = 0;
@@ -288,6 +289,13 @@ impl<M: InputModeKind> InputBaseState<M> {
             self.selected_range =
                 (selected_range.start + added_len..selected_range.end + added_len).into();
         }
+        if self.text.len() != original_len {
+            self.undo_manager.set_last_selection_after(
+                self.selected_range,
+                self.selection_reversed,
+                self.selection_snapshot(),
+            );
+        }
     }
 
     pub(super) fn outdent(&mut self, block: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -298,6 +306,7 @@ impl<M: InputModeKind> InputBaseState<M> {
 
         // Indentation retains its existing single-selection command behavior.
         self.collapse_secondary_selections();
+        let original_len = self.text.len();
         let tab_indent = self.mode.tab_size().to_string();
         let selected_range = self.selected_range;
         let mut removed_len = 0;
@@ -364,6 +373,13 @@ impl<M: InputModeKind> InputBaseState<M> {
                 let new_offset = start_offset.saturating_sub(removed_len);
                 self.selected_range = (new_offset..new_offset).into();
             }
+        }
+        if self.text.len() != original_len {
+            self.undo_manager.set_last_selection_after(
+                self.selected_range,
+                self.selection_reversed,
+                self.selection_snapshot(),
+            );
         }
     }
 }

@@ -489,3 +489,183 @@ fn multi_selection_local_folds_noop_search_and_scalar_history(cx: &mut TestAppCo
         })
         .unwrap();
 }
+
+#[gpui::test]
+fn multi_selection_singleton_ordinary_history(cx: &mut TestAppContext) {
+    let view = InputView::new(cx);
+    view.window_handle
+        .update(cx, |_, window, cx| {
+            view.input.update(cx, |state, cx| {
+                state.set_value("abc", window, cx);
+                let before = vec![
+                    EditorSelection::new(7, 2, 1)
+                        .with_line_end_affinity(true)
+                        .with_preferred_column(Some((px(17.), 4))),
+                ];
+                state.set_selections(before.clone(), 7, cx);
+                state.replace("X", window, cx);
+                let after = state.selections();
+                state.set_selections(vec![EditorSelection::new(99, 0, 0)], 99, cx);
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.value(), "abc");
+                assert_eq!(state.selections(), before);
+                state.redo(&Redo, window, cx);
+                assert_eq!(state.value(), "aXc");
+                assert_eq!(state.selections(), after);
+            })
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn multi_selection_singleton_typing_coalesces_and_noop_preserves_redo(cx: &mut TestAppContext) {
+    let view = InputView::new(cx);
+    view.window_handle
+        .update(cx, |_, window, cx| {
+            view.input.update(cx, |state, cx| {
+                state.set_value("", window, cx);
+                let before = vec![
+                    EditorSelection::new(7, 0, 0)
+                        .with_line_end_affinity(true)
+                        .with_preferred_column(Some((px(17.), 4))),
+                ];
+                state.set_selections(before.clone(), 7, cx);
+                state.replace_text_in_range(None, "a", window, cx);
+                state.replace_text_in_range(None, "b", window, cx);
+                let after = state.selections();
+                state.set_selections(vec![EditorSelection::new(99, 0, 0)], 99, cx);
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.value(), "");
+                assert_eq!(state.selections(), before);
+                assert!(!state.undo_manager.has_undos());
+                state.replace("", window, cx);
+                state.redo(&Redo, window, cx);
+                assert_eq!(state.value(), "ab");
+                assert_eq!(state.selections(), after);
+            })
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn multi_selection_singleton_ime_history_and_save_boundary(cx: &mut TestAppContext) {
+    let view = InputView::new(cx);
+    view.window_handle
+        .update(cx, |_, window, cx| {
+            view.input.update(cx, |state, cx| {
+                state.set_value("abc", window, cx);
+                state.set_selections(
+                    vec![EditorSelection::new(7, 1, 2).with_line_end_affinity(true)],
+                    7,
+                    cx,
+                );
+                let before = state.selections();
+                state.replace_and_mark_text_in_range(None, "q", Some(1..1), window, cx);
+                state.replace_and_mark_text_in_range(None, "qu", Some(2..2), window, cx);
+                state.break_undo_coalescing();
+                let saved = state.selections();
+                state.replace_text_in_range(None, "文", window, cx);
+                let after = state.selections();
+                state.set_selections(vec![EditorSelection::new(99, 0, 0)], 99, cx);
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.value(), "aquc");
+                assert_eq!(state.selections(), saved);
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.value(), "abc");
+                assert_eq!(state.selections(), before);
+                state.redo(&Redo, window, cx);
+                state.redo(&Redo, window, cx);
+                assert_eq!(state.value(), "a文c");
+                assert_eq!(state.selections(), after);
+            })
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn multi_selection_singleton_language_and_indentation_history(cx: &mut TestAppContext) {
+    let view = InputView::new(cx);
+    view.window_handle
+        .update(cx, |_, window, cx| {
+            view.input.update(cx, |state, cx| {
+                for command in 0..4 {
+                    let (source, anchor, head) = match command {
+                        0 => ("{}\nxx", 1, 1),
+                        1 => ("{}\nxx", 2, 0),
+                        2 => ("abc\nxyz", 3, 0),
+                        _ => ("    abc\nxyz", 7, 4),
+                    };
+                    state.set_value(source, window, cx);
+                    *state.mode.highlighter().unwrap().borrow_mut() =
+                        Some(Box::new(MultiSelectionLanguage));
+                    state.set_selections(
+                        vec![EditorSelection::new(7, anchor, head).with_line_end_affinity(true)],
+                        7,
+                        cx,
+                    );
+                    let before = state.selections();
+                    match command {
+                        0 => state.enter(
+                            &Enter {
+                                secondary: false,
+                                shift: false,
+                            },
+                            window,
+                            cx,
+                        ),
+                        1 => state.toggle_comment(&ToggleComment, window, cx),
+                        2 => state.indent(true, window, cx),
+                        _ => state.outdent(true, window, cx),
+                    }
+                    let value = state.value();
+                    let after = state.selections();
+                    state.set_selections(vec![EditorSelection::new(99, 0, 0)], 99, cx);
+                    state.undo(&Undo, window, cx);
+                    assert_eq!(state.value(), source, "command {command}");
+                    assert_eq!(state.selections(), before, "command {command}");
+                    state.redo(&Redo, window, cx);
+                    assert_eq!(state.value(), value, "command {command}");
+                    assert_eq!(state.selections(), after, "command {command}");
+                }
+            })
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn multi_selection_singleton_deletion_coalesces_with_affinity(cx: &mut TestAppContext) {
+    let view = InputView::new(cx);
+    view.window_handle
+        .update(cx, |_, window, cx| {
+            view.input.update(cx, |state, cx| {
+                for backwards in [false, true] {
+                    state.set_value("abcd", window, cx);
+                    let offset = if backwards { 4 } else { 0 };
+                    state.set_selections(
+                        vec![EditorSelection::new(7, offset, offset).with_line_end_affinity(true)],
+                        7,
+                        cx,
+                    );
+                    let before = state.selections();
+                    for _ in 0..2 {
+                        if backwards {
+                            state.backspace(&Backspace, window, cx);
+                        } else {
+                            state.delete(&Delete, window, cx);
+                        }
+                    }
+                    let after = state.selections();
+                    let value = state.value();
+                    state.set_selections(vec![EditorSelection::new(99, 0, 0)], 99, cx);
+                    state.undo(&Undo, window, cx);
+                    assert_eq!(state.value(), "abcd");
+                    assert_eq!(state.selections(), before);
+                    assert!(!state.undo_manager.has_undos());
+                    state.redo(&Redo, window, cx);
+                    assert_eq!(state.value(), value);
+                    assert_eq!(state.selections(), after);
+                }
+            })
+        })
+        .unwrap();
+}

@@ -1480,7 +1480,6 @@ impl<M: InputModeKind> InputBaseState<M> {
             // Retain the cursor effects previously supplied by select_to, without
             // replacing the selection that validation and history must observe.
             M::clear_inline_completion(self, cx);
-            self.cursor_line_end_affinity = false;
         }
         let range = if self.selected_range.is_empty() {
             let offset = self.cursor();
@@ -2083,17 +2082,17 @@ impl<M: InputModeKind> InputBaseState<M> {
         }
     }
 
-    fn push_history(
-        &mut self,
+    fn make_history_change(
+        &self,
         text: &Rope,
         range: &Range<usize>,
         new_text: &str,
         requested_intent: Option<EditIntent>,
         selection_before: Selection,
         selection_after: Option<Selection>,
-    ) {
+    ) -> Option<(Change, EditIntent)> {
         if self.undo_manager.is_ignoring() {
-            return;
+            return None;
         }
 
         let range =
@@ -2116,7 +2115,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         let selection_after =
             selection_after.unwrap_or_else(|| Selection::new(new_range.end, new_range.end));
 
-        self.undo_manager.record_transaction(
+        Some((
             Change::new(
                 range,
                 &old_text,
@@ -2127,7 +2126,20 @@ impl<M: InputModeKind> InputBaseState<M> {
             )
             .with_selection_direction(self.selection_reversed),
             intent,
-        );
+        ))
+    }
+
+    /// Record snapshots with the actual change after the final caret is known.
+    fn record_history_change(
+        &mut self,
+        change: Option<(Change, EditIntent)>,
+        before: Option<super::selection_set::SelectionSnapshot>,
+    ) {
+        if let Some((change, intent)) = change {
+            let selections = before.map(|before| (before, self.selection_snapshot()));
+            self.undo_manager
+                .record_transaction(change, intent, selections);
+        }
     }
 
     /// Prevent subsequent edits from coalescing with earlier undo history.
@@ -2786,6 +2798,19 @@ impl<M: InputModeKind> InputBaseState<M> {
             self.begin_atomic_edit_batch(None);
         }
         self.collapse_secondary_selections();
+        let selections_before = (M::CODE_EDITOR
+            && !self.undo_manager.is_atomic_batch()
+            && !self.undo_manager.is_ignoring())
+        .then(|| self.selection_snapshot());
+        // Capture the old caret affinity before the deletion command clears it.
+        if self.selected_range.is_empty()
+            && matches!(
+                requested_intent,
+                Some(EditIntent::Backspace | EditIntent::DeleteForward)
+            )
+        {
+            self.cursor_line_end_affinity = false;
+        }
         // A text edit invalidates the gesture's original word/line offsets.
         self.stop_mouse_selection();
         let selection_before = self.selected_range;
@@ -2892,34 +2917,28 @@ impl<M: InputModeKind> InputBaseState<M> {
         } else {
             M::adjust_annotations(self, &range, new_text.len());
         }
-        if mask_changed {
+        let history_change = if mask_changed {
             // A segment-based history entry no longer matches the masked
             // document, record a whole-document change instead, so that
             // undo/redo can restore the text exactly.
-            self.push_history(
+            self.make_history_change(
                 &old_text,
                 &(0..old_text.len()),
                 &self.text.to_string(),
                 Some(EditIntent::Atomic),
                 selection_before,
                 Some(Selection::new(new_offset, new_offset)),
-            );
+            )
         } else {
-            self.push_history(
+            self.make_history_change(
                 &old_text,
                 &range,
                 &new_text,
                 requested_intent,
                 selection_before,
                 None,
-            );
-        }
-        // A commit ends the IME composition: macOS delivers `insertText:` for
-        // the confirmed candidate without a following `unmarkText`, so close
-        // the transaction here. Leaving it open would keep merging every later
-        // edit into the same change, which then carries the text and selection
-        // of the first composition.
-        self.undo_manager.commit_transaction();
+            )
+        };
         // Fold and annotation coordinates must track every localized edit,
         // even when display/parsing and observers see only the finished batch.
         self.display_map
@@ -2927,6 +2946,8 @@ impl<M: InputModeKind> InputBaseState<M> {
         if self.undo_manager.is_atomic_batch() {
             self.selected_range = (new_offset..new_offset).into();
             self.ime_marked_range.take();
+            self.record_history_change(history_change, None);
+            self.undo_manager.commit_transaction();
             if owns_batch {
                 self.finish_atomic_edit_batch(old_text, window, cx);
                 if !self.silent_replace_text {
@@ -2958,6 +2979,9 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.selected_range = (new_offset..new_offset).into();
         self.ime_marked_range.take();
         self.update_preferred_column();
+        self.record_history_change(history_change, selections_before);
+        // insertText confirms IME even without a following unmarkText callback.
+        self.undo_manager.commit_transaction();
         self.update_search(cx);
         if self.is_multi_line() {
             self.mode.update_auto_grow(&self.display_map);
@@ -3161,6 +3185,10 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
             return;
         }
         self.collapse_secondary_selections();
+        let selections_before = (M::CODE_EDITOR
+            && !self.undo_manager.is_atomic_batch()
+            && !self.undo_manager.is_ignoring())
+        .then(|| self.selection_snapshot());
         // A text edit invalidates the gesture's original word/line offsets.
         self.stop_mouse_selection();
         let selection_before = self.selected_range;
@@ -3245,7 +3273,7 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         if self.is_multi_line() {
             self.mode.update_auto_grow(&self.display_map);
         }
-        self.push_history(
+        let history_change = self.make_history_change(
             &old_text,
             &range,
             new_text,
@@ -3253,6 +3281,7 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
             selection_before,
             Some(self.selected_range),
         );
+        self.record_history_change(history_change, selections_before);
         if new_text.is_empty() {
             self.undo_manager.commit_transaction();
         }
