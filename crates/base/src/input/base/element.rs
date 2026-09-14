@@ -858,7 +858,7 @@ impl<M: InputModeKind> TextElement<M> {
         paths
     }
 
-    fn layout_selections(
+    pub(crate) fn layout_selections(
         &self,
         last_layout: &LastLayout,
         bounds: &mut Bounds<Pixels>,
@@ -908,12 +908,12 @@ impl<M: InputModeKind> TextElement<M> {
             .filter_map(|selection| {
                 let offset = selection.head();
                 let row = state.text.offset_to_point(offset).row;
-                let index = last_layout
+                let ix = last_layout
                     .visible_buffer_lines
                     .iter()
                     .position(|line| *line == row)?;
-                let local = offset.saturating_sub(last_layout.visible_line_byte_offsets[index]);
-                let pos = last_layout.lines[index].position_for_index(
+                let local = offset.saturating_sub(last_layout.visible_line_byte_offsets[ix]);
+                let pos = last_layout.lines[ix].position_for_index(
                     local,
                     last_layout,
                     selection.line_end_affinity(),

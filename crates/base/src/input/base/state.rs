@@ -574,7 +574,12 @@ impl<M: InputModeKind> InputBaseState<M> {
     ///
     /// A masked input keeps its value out of the clipboard.
     pub fn is_copyable(&self) -> bool {
-        !self.selected_range.is_empty() && !self.masked
+        !self.masked
+            && self
+                .selection_snapshot()
+                .selections
+                .iter()
+                .any(|selection| !selection.range().is_empty())
     }
 
     pub fn context_menu_capabilities(&self) -> InputContextMenuCapabilities {
@@ -583,7 +588,12 @@ impl<M: InputModeKind> InputBaseState<M> {
             .disabled(self.disabled)
             .readonly(self.readonly)
             .code_editor(self.is_code_editor())
-            .selection(!self.selected_range.is_empty())
+            .selection(
+                self.selection_snapshot()
+                    .selections
+                    .iter()
+                    .any(|selection| !selection.range().is_empty()),
+            )
             .masked(self.masked)
             .go_to_definition(go_to_definition)
             .code_actions(code_actions)
@@ -1782,7 +1792,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             cx.notify();
             return;
         }
-        if self.clean_on_escape {
+        if self.clean_on_escape && self.is_editable() {
             return self.clean(window, cx);
         }
 
@@ -3522,6 +3532,10 @@ impl<M: InputModeKind> Render for InputBaseState<M> {
                 CONTEXT
             })
             .track_focus(&self.focus_handle)
+            .when(
+                self.is_editable() || (M::CODE_EDITOR && !self.disabled),
+                |this| this.on_action(window.listener_for(&entity, InputBaseState::escape)),
+            )
             .when(self.is_editable(), |this| {
                 this.on_action(window.listener_for(&entity, InputBaseState::backspace))
                     .on_action(window.listener_for(&entity, InputBaseState::delete))
@@ -3532,7 +3546,6 @@ impl<M: InputModeKind> Render for InputBaseState<M> {
                     .on_action(window.listener_for(&entity, InputBaseState::delete_previous_word))
                     .on_action(window.listener_for(&entity, InputBaseState::delete_next_word))
                     .on_action(window.listener_for(&entity, InputBaseState::enter))
-                    .on_action(window.listener_for(&entity, InputBaseState::escape))
                     .on_action(window.listener_for(&entity, InputBaseState::paste))
                     .on_action(window.listener_for(&entity, InputBaseState::cut))
                     .on_action(window.listener_for(&entity, InputBaseState::undo))

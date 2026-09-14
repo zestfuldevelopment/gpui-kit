@@ -1,5 +1,8 @@
 //! Editor gestures and commands planned against one immutable rope revision.
-use std::{collections::BTreeSet, ops::Range};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashSet},
+    ops::Range,
+};
 
 use gpui::{Context, Window};
 use unicode_segmentation::UnicodeSegmentation;
@@ -27,7 +30,7 @@ impl EditorState {
         let offset = grapheme::floor(&self.text, offset);
         let mut selections = self.selections();
         let mut primary = self.primary_selection_id();
-        if let Some(index) = selections
+        if let Some(ix) = selections
             .iter()
             .position(|s| s.range().is_empty() && s.head() == offset)
         {
@@ -35,11 +38,11 @@ impl EditorState {
                 self.stop_mouse_selection();
                 return;
             }
-            if selections.remove(index).id() == primary {
+            if selections.remove(ix).id() == primary {
                 primary = selections[0].id();
             }
         } else {
-            let id = next_identity(&selections);
+            let id = next_selection_id(&selections);
             selections
                 .push(EditorSelection::new(id, offset, offset).with_line_end_affinity(affinity));
         }
@@ -71,19 +74,24 @@ impl EditorState {
         }
         let mut selections = self.selections();
         let primary = self.primary_selection_id();
-        let index = selections.iter().position(|s| s.id() == primary).unwrap();
+        let ix = selections.iter().position(|s| s.id() == primary).unwrap();
         let source = self.text.to_string();
-        let mut range = selections[index].range();
+        let mut range = selections[ix].range();
         if range.is_empty() {
             let offset = range.start;
             let Some((start, word)) = source
                 .unicode_word_indices()
                 .find(|(start, word)| *start <= offset && offset < *start + word.len())
+                .or_else(|| {
+                    source
+                        .unicode_word_indices()
+                        .find(|(start, word)| *start + word.len() == offset)
+                })
             else {
                 return;
             };
             range = start..start + word.len();
-            selections[index] = EditorSelection::new(primary, range.start, range.end);
+            selections[ix] = EditorSelection::new(primary, range.start, range.end);
             if !all {
                 self.set_selections(selections, primary, cx);
                 return;
@@ -93,38 +101,64 @@ impl EditorState {
         if query.is_empty() {
             return;
         }
-        let matches: Vec<_> = source
-            .match_indices(query)
-            .map(|(start, _)| start..start + query.len())
-            .filter(|r| {
-                grapheme::floor(&self.text, r.start) == r.start
-                    && grapheme::ceil(&self.text, r.end) == r.end
+        // Enumerate overlapping literal candidates too: an existing selection
+        // can begin between the matches of a globally nonoverlapping search.
+        let Ok(matcher) = aho_corasick::AhoCorasick::new([query]) else {
+            return;
+        };
+        let matches: Vec<_> = matcher
+            .find_overlapping_iter(source.as_bytes())
+            .map(|found| found.start()..found.end())
+            .filter(|range| {
+                grapheme::floor(&self.text, range.start) == range.start
+                    && grapheme::ceil(&self.text, range.end) == range.end
             })
             .collect();
-        // Continue beyond the last matching selection, preserving the primary's identity.
         let after = selections
             .iter()
             .filter(|s| source[s.range()] == *query)
             .map(|s| s.range().end)
             .max()
             .unwrap_or(range.end);
-        let mut candidates = matches
+        let candidates = matches
             .iter()
             .filter(|r| r.start >= after)
             .chain(matches.iter().filter(|r| r.start < after));
+        let mut occupied: BTreeMap<usize, usize> = selections
+            .iter()
+            .map(|s| (s.range().start, s.range().end))
+            .collect();
+        let mut identities: HashSet<u64> = selections.iter().map(EditorSelection::id).collect();
+        let mut id = next_selection_id(&selections);
         let mut revealed = Vec::new();
-        for candidate in &mut candidates {
-            if selections.iter().any(|s| overlaps(&s.range(), candidate)) {
+        for candidate in candidates {
+            let overlaps =
+                occupied
+                    .range(..candidate.end)
+                    .next_back()
+                    .is_some_and(|(&start, &end)| {
+                        end > candidate.start || start == end && end == candidate.start
+                    })
+                    || occupied
+                        .get(&candidate.end)
+                        .is_some_and(|end| *end == candidate.end);
+            if overlaps {
                 continue;
             }
-            let id = next_identity(&selections);
             selections.push(EditorSelection::new(id, candidate.start, candidate.end));
+            identities.insert(id);
+            id = id.wrapping_add(1);
+            while identities.contains(&id) {
+                id = id.wrapping_add(1);
+            }
+            occupied.insert(candidate.start, candidate.end);
             revealed.push(candidate.clone());
             if !all {
                 break;
             }
         }
         if self.set_selections(selections, primary, cx) {
+            let reveal_offset = revealed.last().map(|range| range.start);
             for range in revealed {
                 let start = self.text.offset_to_point(range.start).row;
                 let end = self.text.offset_to_point(range.end.saturating_sub(1)).row;
@@ -138,6 +172,9 @@ impl EditorState {
                 for row in folds {
                     self.display_map.set_folded(row, false);
                 }
+            }
+            if !all && let Some(offset) = reveal_offset {
+                self.scroll_to(offset, None, cx);
             }
             cx.notify();
         }
@@ -157,7 +194,7 @@ impl EditorState {
         let selections = self.selections();
         let mut edits = Vec::with_capacity(selections.len());
         let mut carets = Vec::with_capacity(selections.len());
-        for (index, selection) in selections.iter().enumerate() {
+        for (ix, selection) in selections.iter().enumerate() {
             let mut range = selection.range();
             let mut replacement = self.normalize_input(text).into_owned();
             if range.is_empty() {
@@ -175,7 +212,7 @@ impl EditorState {
                         .slice(start..end)
                         .chars()
                         .all(|c| matches!(c, ' ' | '\t'))
-                    && (index == 0 || selections[index - 1].range().end < start)
+                    && (ix == 0 || selections[ix - 1].range().end < start)
                 {
                     let indent = self.mode.highlighter().and_then(|h| {
                         h.borrow()
@@ -221,7 +258,7 @@ impl EditorState {
         };
         let mut edits = Vec::with_capacity(selections.len());
         let mut carets = Vec::with_capacity(selections.len());
-        for (index, selection) in selections.iter().enumerate() {
+        for (ix, selection) in selections.iter().enumerate() {
             let mut range = selection.range();
             let plan = self.mode.highlighter().and_then(|h| {
                 h.borrow().as_ref()?.newline_indent(
@@ -244,7 +281,7 @@ impl EditorState {
             let caret = self.normalize_input(&text).len();
             if let Some(closing) = plan.as_ref().and_then(|p| p.closing_indent()) {
                 let limit = selections
-                    .get(index + 1)
+                    .get(ix + 1)
                     .map(|s| s.range().start)
                     .unwrap_or(self.text.len());
                 range.end += self
@@ -354,19 +391,25 @@ impl EditorState {
                 .windows(2)
                 .all(|pair| pair[0].range.end <= pair[1].range.start)
         );
+        let mut deltas = Vec::with_capacity(edits.len() + 1);
+        deltas.push(0isize);
+        for edit in &edits {
+            deltas.push(
+                deltas.last().unwrap() + edit.text.len() as isize - edit.range.len() as isize,
+            );
+        }
         let map = |offset: usize, right: bool| {
-            let mut delta = 0isize;
-            for edit in &edits {
-                if offset < edit.range.start || (!right && offset == edit.range.start) {
-                    break;
-                }
-                if offset <= edit.range.end {
-                    return edit.range.start.saturating_add_signed(delta)
-                        + if right { edit.text.len() } else { 0 };
-                }
-                delta += edit.text.len() as isize - edit.range.len() as isize;
+            // A prior edit ending here contributes its full delta even for a
+            // left-affinity endpoint belonging to the next adjacent edit.
+            let ix =
+                edits.partition_point(|edit| edit.range.end <= offset && edit.range.start < offset);
+            let delta = deltas[ix];
+            if let Some(edit) = edits.get(ix).filter(|edit| edit.range.start <= offset) {
+                edit.range.start.saturating_add_signed(delta)
+                    + if right { edit.text.len() } else { 0 }
+            } else {
+                offset.saturating_add_signed(delta)
             }
-            offset.saturating_add_signed(delta)
         };
         let after = if let Some(carets) = carets {
             carets
@@ -407,7 +450,7 @@ impl EditorState {
     }
 }
 
-fn next_identity(selections: &[EditorSelection]) -> u64 {
+fn next_selection_id(selections: &[EditorSelection]) -> u64 {
     let mut id = selections
         .iter()
         .map(EditorSelection::id)
@@ -418,8 +461,4 @@ fn next_identity(selections: &[EditorSelection]) -> u64 {
         id = id.wrapping_add(1);
     }
     id
-}
-
-fn overlaps(a: &Range<usize>, b: &Range<usize>) -> bool {
-    a.start < b.end && b.start < a.end || a.is_empty() && b.start <= a.start && a.start <= b.end
 }
