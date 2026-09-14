@@ -864,37 +864,72 @@ impl<M: InputModeKind> TextElement<M> {
         bounds: &mut Bounds<Pixels>,
         window: &mut Window,
         cx: &mut App,
-    ) -> Option<Path<Pixels>> {
+    ) -> Vec<Path<Pixels>> {
         let state = self.state.read(cx);
-        if !state.focus_handle.is_focused(window) {
-            return None;
+        if !state.focus_handle.is_focused(window)
+            || state
+                .ime_marked_range
+                .is_some_and(|range| !range.is_empty())
+        {
+            return Vec::new();
         }
+        state
+            .selection_snapshot()
+            .selections
+            .iter()
+            .filter_map(|selection| {
+                let mut range = selection.range();
+                if state.masked {
+                    range.start = masked_display_offset(&state.text, range.start);
+                    range.end = masked_display_offset(&state.text, range.end);
+                }
+                range.start = range.start.max(last_layout.visible_range_offset.start);
+                range.end = range.end.min(last_layout.visible_range_offset.end);
+                (range.start < range.end)
+                    .then(|| Self::layout_match_range(range, last_layout, bounds))
+                    .flatten()
+            })
+            .collect()
+    }
 
-        let mut selected_range = state.selected_range;
-        if let Some(ime_marked_range) = &state.ime_marked_range {
-            if !ime_marked_range.is_empty() {
-                selected_range = (ime_marked_range.end..ime_marked_range.end).into();
-            }
-        }
-        if selected_range.is_empty() {
-            return None;
-        }
-
-        if state.masked {
-            selected_range.start = masked_display_offset(&state.text, selected_range.start);
-            selected_range.end = masked_display_offset(&state.text, selected_range.end);
-        }
-
-        let (start_ix, end_ix) = if selected_range.start < selected_range.end {
-            (selected_range.start, selected_range.end)
-        } else {
-            (selected_range.end, selected_range.start)
-        };
-
-        let range = start_ix.max(last_layout.visible_range_offset.start)
-            ..end_ix.min(last_layout.visible_range_offset.end);
-
-        Self::layout_match_range(range, &last_layout, bounds)
+    /// Resolve secondary carets through the same shaped lines and wrap affinity
+    /// as the primary, without changing its scroll-follow or IME anchor.
+    pub(crate) fn secondary_caret_bounds(
+        state: &InputBaseState<M>,
+        last_layout: &LastLayout,
+        bounds: &Bounds<Pixels>,
+    ) -> Vec<Bounds<Pixels>> {
+        let height = last_layout.line_height * 0.85;
+        state
+            .selection_snapshot()
+            .selections
+            .iter()
+            .filter(|s| s.id() != state.selection_set.primary_id())
+            .filter_map(|selection| {
+                let offset = selection.head();
+                let row = state.text.offset_to_point(offset).row;
+                let index = last_layout
+                    .visible_buffer_lines
+                    .iter()
+                    .position(|line| *line == row)?;
+                let local = offset.saturating_sub(last_layout.visible_line_byte_offsets[index]);
+                let pos = last_layout.lines[index].position_for_index(
+                    local,
+                    last_layout,
+                    selection.line_end_affinity(),
+                )?;
+                let top =
+                    state.display_map.buffer_line_to_display_row(row) * last_layout.line_height;
+                Some(Bounds::new(
+                    bounds.origin
+                        + point(
+                            last_layout.line_number_width + pos.x,
+                            top + pos.y + (last_layout.line_height - height) / 2.,
+                        ),
+                    size(CURSOR_WIDTH, height),
+                ))
+            })
+            .collect()
     }
 
     /// Calculate the visible range of lines in the viewport.
@@ -1627,7 +1662,8 @@ pub(super) struct PrepaintState {
     cursor_scroll_offset: Point<Pixels>,
     /// row index (zero based), no wrap, same line as the cursor.
     current_row: Option<usize>,
-    selection_path: Option<Path<Pixels>>,
+    selection_paths: Vec<Path<Pixels>>,
+    secondary_caret_bounds: Vec<Bounds<Pixels>>,
     hover_highlight_path: Option<Path<Pixels>>,
     search_match_paths: Vec<(Path<Pixels>, bool)>,
     document_color_paths: Vec<(Path<Pixels>, Hsla)>,
@@ -2044,7 +2080,9 @@ impl<M: InputModeKind> Element for TextElement<M> {
         last_layout.cursor_bounds = cursor_bounds;
 
         let search_match_paths = self.layout_search_matches(&last_layout, &mut bounds, cx);
-        let selection_path = self.layout_selections(&last_layout, &mut bounds, window, cx);
+        let selection_paths = self.layout_selections(&last_layout, &mut bounds, window, cx);
+        let secondary_caret_bounds =
+            Self::secondary_caret_bounds(self.state.read(cx), &last_layout, &bounds);
         let hover_highlight_path = self.layout_hover_highlight(&last_layout, &mut bounds, cx);
         let document_color_paths =
             self.layout_document_colors(&document_colors, &last_layout, &bounds, cx);
@@ -2123,7 +2161,8 @@ impl<M: InputModeKind> Element for TextElement<M> {
             cursor_bounds,
             cursor_scroll_offset,
             current_row,
-            selection_path,
+            selection_paths,
+            secondary_caret_bounds,
             search_match_paths,
             hover_highlight_path,
             hover_definition_hitbox,
@@ -2271,7 +2310,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
                 }
             }
 
-            if let Some(path) = prepaint.selection_path.take() {
+            for path in prepaint.selection_paths.drain(..) {
                 window.paint_path(path, editor_style.selection);
             }
 
@@ -2358,6 +2397,12 @@ impl<M: InputModeKind> Element for TextElement<M> {
         if focused && show_cursor {
             if let Some(cursor_bounds) = prepaint.cursor_bounds_with_scroll() {
                 window.paint_quad(fill(cursor_bounds, editor_style.caret));
+            }
+        }
+
+        if focused && show_cursor {
+            for bounds in &prepaint.secondary_caret_bounds {
+                window.paint_quad(fill(*bounds, editor_style.caret));
             }
         }
 

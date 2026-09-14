@@ -239,7 +239,10 @@ impl<M: InputModeKind> InputBaseState<M> {
         if !self.is_editable() {
             return;
         }
-        // Edit only the primary, but retain the full collection for Undo.
+        if M::indent_multiple(self, false, block, window, cx) {
+            return;
+        }
+        // Retain the singleton path and its existing selection behavior.
         let old_text = self.text.clone();
         self.begin_atomic_edit_batch(None);
         self.collapse_secondary_selections();
@@ -305,7 +308,10 @@ impl<M: InputModeKind> InputBaseState<M> {
         if !self.is_editable() {
             return;
         }
-        // Edit only the primary, but retain the full collection for Undo.
+        if M::indent_multiple(self, true, block, window, cx) {
+            return;
+        }
+        // Retain the singleton path and its existing selection behavior.
         let old_text = self.text.clone();
         self.begin_atomic_edit_batch(None);
         self.collapse_secondary_selections();

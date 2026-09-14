@@ -12,9 +12,8 @@ impl EditorState {
     /// rejected unchanged. Returns whether the request was accepted, including
     /// an unchanged valid set.
     ///
-    /// Ordinary movement, pointer selection, and IME entry collapse to the
-    /// primary. Indent/outdent also retain their single-selection behavior;
-    /// only the explicit selection-edit methods below edit every selection.
+    /// Ordinary movement, plain pointer selection, and IME entry collapse to
+    /// the primary. Editor typing and editing commands apply to all members.
     pub fn set_selections(
         &mut self,
         selections: Vec<EditorSelection>,

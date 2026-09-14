@@ -111,6 +111,8 @@ actions!(
         NextSearchMatch,
         PreviousSearchMatch,
         GoToDefinition,
+        SelectNextOccurrence,
+        SelectAllOccurrences,
     ]
 );
 
@@ -132,6 +134,18 @@ pub(super) const CONTEXT: &str = "Input";
 
 pub(crate) fn init(cx: &mut App) {
     cx.bind_keys([
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-d", SelectNextOccurrence, Some("InputCodeEditor")),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-d", SelectNextOccurrence, Some("InputCodeEditor")),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-shift-l", SelectAllOccurrences, Some("InputCodeEditor")),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new(
+            "ctrl-shift-l",
+            SelectAllOccurrences,
+            Some("InputCodeEditor"),
+        ),
         KeyBinding::new("f3", NextSearchMatch, Some(CONTEXT)),
         KeyBinding::new("shift-f3", PreviousSearchMatch, Some(CONTEXT)),
         KeyBinding::new("backspace", Backspace, Some(CONTEXT)),
@@ -930,7 +944,13 @@ impl<M: InputModeKind> InputBaseState<M> {
         let text: SharedString = text.into();
         self.with_edits_allowed(|this| {
             this.undo_manager.pending_intent = Some(EditIntent::Atomic);
-            this.replace_text_in_range_silent(None, &text, window, cx);
+            let range = this.ime_marked_range.unwrap_or(this.selected_range);
+            this.replace_text_in_range_silent(
+                Some(this.range_to_utf16(&(range.start..range.end))),
+                &text,
+                window,
+                cx,
+            );
             this.selected_range = (this.selected_range.end..this.selected_range.end).into();
         });
     }
@@ -1482,6 +1502,9 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     fn delete_grapheme(&mut self, backwards: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if M::delete_multiple(self, backwards, window, cx) {
+            return;
+        }
         if self.selected_range.is_empty() {
             // Retain the cursor effects previously supplied by select_to, without
             // replacing the selection that validation and history must observe.
@@ -1633,6 +1656,13 @@ impl<M: InputModeKind> InputBaseState<M> {
         // a newline.
         let insert_newline = self.is_multi_line() && (!self.submit_on_enter || action.shift);
 
+        if insert_newline && M::newline_multiple(self, window, cx) {
+            cx.emit(InputEvent::PressEnter {
+                secondary: action.secondary,
+                shift: action.shift,
+            });
+            return;
+        }
         if insert_newline {
             let mut replacement: Range<usize> = self.selected_range.into();
             if replacement.is_empty() {
@@ -1746,6 +1776,12 @@ impl<M: InputModeKind> InputBaseState<M> {
             self.unmark_text(window, cx);
         }
 
+        if M::CODE_EDITOR && self.selection_set.has_secondary() {
+            self.collapse_secondary_selections();
+            self.undo_manager.break_transaction_coalescing();
+            cx.notify();
+            return;
+        }
         if self.clean_on_escape {
             return self.clean(window, cx);
         }
@@ -1791,7 +1827,9 @@ impl<M: InputModeKind> InputBaseState<M> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.collapse_secondary_selections();
+        if self.disabled {
+            return;
+        }
         self.undo_manager.break_transaction_coalescing();
         // Input has its own text selection; suppress the window-level text
         // selection (Root) so it does not start a drag from here.
@@ -1816,6 +1854,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             return;
         }
 
+        self.collapse_secondary_selections();
         // Triple click to select line
         if event.button == MouseButton::Left && event.click_count >= 3 {
             self.select_line(offset, window, cx);
@@ -2063,7 +2102,17 @@ impl<M: InputModeKind> InputBaseState<M> {
             return;
         }
 
-        let selected_text = self.text.slice(self.selected_range).to_string();
+        let selected_text = self
+            .selection_snapshot()
+            .selections
+            .iter()
+            .filter(|selection| !selection.range().is_empty())
+            .map(|selection| self.text.slice(selection.range()).to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if selected_text.is_empty() {
+            return;
+        }
         cx.write_to_clipboard(ClipboardItem::new_string(selected_text));
     }
 
@@ -2072,7 +2121,17 @@ impl<M: InputModeKind> InputBaseState<M> {
             return;
         }
 
-        let selected_text = self.text.slice(self.selected_range).to_string();
+        let selected_text = self
+            .selection_snapshot()
+            .selections
+            .iter()
+            .filter(|selection| !selection.range().is_empty())
+            .map(|selection| self.text.slice(selection.range()).to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if selected_text.is_empty() {
+            return;
+        }
         cx.write_to_clipboard(ClipboardItem::new_string(selected_text));
 
         self.undo_manager.pending_intent = Some(EditIntent::Atomic);
@@ -2794,6 +2853,22 @@ impl<M: InputModeKind> InputBaseState<M> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        if range_utf16.is_none()
+            && self.ime_marked_range.is_none()
+            && !self.undo_manager.is_atomic_batch()
+            && !self.undo_manager.is_ignoring()
+            && matches!(source, ReplacementSource::Input)
+            && M::replace_multiple(
+                self,
+                new_text,
+                !self.silent_replace_text && self.undo_manager.pending_intent.is_none(),
+                window,
+                cx,
+            )
+        {
+            self.undo_manager.pending_intent = None;
+            return true;
+        }
         let mut requested_intent = self.undo_manager.pending_intent.take();
         if !self.is_editable() {
             return false;
@@ -3441,7 +3516,11 @@ impl<M: InputModeKind> Render for InputBaseState<M> {
 
         let element = div()
             .id("input-state")
-            .key_context(CONTEXT)
+            .key_context(if M::CODE_EDITOR {
+                "Input InputCodeEditor"
+            } else {
+                CONTEXT
+            })
             .track_focus(&self.focus_handle)
             .when(self.is_editable(), |this| {
                 this.on_action(window.listener_for(&entity, InputBaseState::backspace))
@@ -3543,6 +3622,7 @@ impl<M: InputModeKind> Render for InputBaseState<M> {
 mod tests {
     include!("grapheme_tests.rs");
     include!("../editor/multi_selection_tests.rs");
+    include!("../editor/multi_cursor_tests.rs");
     include!("mouse_selection_tests.rs");
 
     use super::*;

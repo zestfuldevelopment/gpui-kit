@@ -65,6 +65,10 @@ impl EditorState {
         if !self.is_editable() || self.ime_marked_range.is_some() {
             return;
         }
+        if self.selection_set.has_secondary() {
+            self.toggle_multiple_comments(window, cx);
+            return;
+        }
         let selection = self.selected_range;
         let range = affected_lines(&self.text, selection);
         let syntax = self.mode.highlighter().and_then(|highlighter| {
@@ -116,6 +120,43 @@ impl EditorState {
             .set_last_selection_after(after, reversed, self.selection_snapshot());
         self.scroll_to(self.cursor(), None, cx);
         cx.notify();
+    }
+    fn toggle_multiple_comments(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let rows: Vec<_> = self.selected_logical_lines().into_iter().collect();
+        let mut groups: Vec<Range<usize>> = Vec::new();
+        for row in rows {
+            if let Some(group) = groups.last_mut()
+                && group.end == row
+            {
+                group.end = row + 1;
+            } else {
+                groups.push(row..row + 1);
+            }
+        }
+        let mut planned = Vec::new();
+        for group in groups {
+            let range =
+                self.text.line_start_offset(group.start)..self.text.line_end_offset(group.end - 1);
+            let syntax = self.mode.highlighter().and_then(|h| {
+                h.borrow()
+                    .as_ref()?
+                    .comment_syntax(&self.text, range.clone())
+            });
+            let Some(syntax) = syntax else {
+                continue;
+            };
+            let source = self.text.slice(range.clone()).to_string();
+            let Some(edits) = comment_edits(&source, &syntax) else {
+                continue;
+            };
+            planned.extend(edits.into_iter().map(|edit| {
+                crate::input::editor::multi_cursor::SelectionEdit {
+                    range: range.start + edit.range.start..range.start + edit.range.end,
+                    text: edit.text,
+                }
+            }));
+        }
+        self.apply_selection_edits(planned, None, window, cx);
     }
 }
 

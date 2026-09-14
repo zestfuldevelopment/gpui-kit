@@ -408,7 +408,7 @@ fn multi_selection_single_language_command_history(cx: &mut TestAppContext) {
                     }
                     let after = state.selections();
                     let value = state.value();
-                    assert_eq!(after.len(), 1);
+                    assert_eq!(after.len(), 2);
                     state.undo(&Undo, window, cx);
                     assert_eq!(state.value(), "{}\nxx");
                     assert_eq!(state.selections(), before);
@@ -671,7 +671,7 @@ fn multi_selection_singleton_deletion_coalesces_with_affinity(cx: &mut TestAppCo
 }
 
 #[gpui::test]
-fn multi_selection_indentation_batches_primary_and_restores_collection(cx: &mut TestAppContext) {
+fn multi_selection_indentation_batches_collection(cx: &mut TestAppContext) {
     let view = InputView::new(cx);
     view.window_handle
         .update(cx, |_, window, cx| {
@@ -680,7 +680,7 @@ fn multi_selection_indentation_batches_primary_and_restores_collection(cx: &mut 
                     let (source, end, secondary, expected) = if outdent {
                         ("  abc\n  xyz\nlast", 11, 12, "abc\nxyz\nlast")
                     } else {
-                        ("abc\nxyz\nlast", 7, 8, "  abc\n  xyz\nlast")
+                        ("abc\nxyz\nlast", 7, 8, "  abc\n  xyz\n  last")
                     };
                     state.set_value(source, window, cx);
                     let before = vec![
@@ -697,7 +697,7 @@ fn multi_selection_indentation_batches_primary_and_restores_collection(cx: &mut 
                     }
                     let after = state.selections();
                     assert_eq!(state.value(), expected);
-                    assert_eq!(after.len(), 1);
+                    assert_eq!(after.len(), 2);
                     state.undo(&Undo, window, cx);
                     assert_eq!(state.value(), source);
                     assert_eq!(state.selections(), before);

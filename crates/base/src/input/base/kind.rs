@@ -147,6 +147,44 @@ pub trait InputModeKind: sealed::Sealed + Sized + 'static {
     /// does not carry an editor's worth of machinery.
     type Extras: InputExtras;
 
+    /// Handles an implicit editor replacement when several selections are active.
+    fn replace_multiple(
+        _state: &mut InputBaseState<Self>,
+        _text: &str,
+        _typed: bool,
+        _window: &mut Window,
+        _cx: &mut gpui::Context<InputBaseState<Self>>,
+    ) -> bool {
+        false
+    }
+    /// Handles a grapheme deletion at every editor caret.
+    fn delete_multiple(
+        _state: &mut InputBaseState<Self>,
+        _backwards: bool,
+        _window: &mut Window,
+        _cx: &mut gpui::Context<InputBaseState<Self>>,
+    ) -> bool {
+        false
+    }
+    /// Plans a newline independently at every editor caret.
+    fn newline_multiple(
+        _state: &mut InputBaseState<Self>,
+        _window: &mut Window,
+        _cx: &mut gpui::Context<InputBaseState<Self>>,
+    ) -> bool {
+        false
+    }
+    /// Handles indentation of the union of selected editor lines.
+    fn indent_multiple(
+        _state: &mut InputBaseState<Self>,
+        _outdent: bool,
+        _block: bool,
+        _window: &mut Window,
+        _cx: &mut gpui::Context<InputBaseState<Self>>,
+    ) -> bool {
+        false
+    }
+
     /// Drives the syntax highlighter after the text changed.
     ///
     /// Only a code editor has one. The engine's edit path is generic over the

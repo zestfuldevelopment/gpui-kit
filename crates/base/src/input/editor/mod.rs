@@ -1,3 +1,4 @@
+pub(super) mod multi_cursor;
 mod multi_selection;
 
 use gpui::{App, Div, Entity, InteractiveElement as _, IntoElement, RenderOnce, Stateful, Window};
@@ -17,6 +18,60 @@ impl InputModeKind for EditorMode {
     const CODE_EDITOR: bool = true;
 
     type Extras = super::EditorExtras;
+
+    fn replace_multiple(
+        state: &mut EditorState,
+        text: &str,
+        typed: bool,
+        window: &mut Window,
+        cx: &mut gpui::Context<EditorState>,
+    ) -> bool {
+        if !state.selection_set.has_secondary() {
+            return false;
+        }
+        state.replace_multiple(text, typed, window, cx);
+        true
+    }
+    fn delete_multiple(
+        state: &mut EditorState,
+        backwards: bool,
+        window: &mut Window,
+        cx: &mut gpui::Context<EditorState>,
+    ) -> bool {
+        if !state.selection_set.has_secondary() || state.ime_marked_range.is_some() {
+            return false;
+        }
+        if backwards {
+            state.backspace_selections(window, cx);
+        } else {
+            state.delete_selections(window, cx);
+        }
+        true
+    }
+    fn newline_multiple(
+        state: &mut EditorState,
+        window: &mut Window,
+        cx: &mut gpui::Context<EditorState>,
+    ) -> bool {
+        if !state.selection_set.has_secondary() || state.ime_marked_range.is_some() {
+            return false;
+        }
+        state.newline_multiple(window, cx);
+        true
+    }
+    fn indent_multiple(
+        state: &mut EditorState,
+        outdent: bool,
+        block: bool,
+        window: &mut Window,
+        cx: &mut gpui::Context<EditorState>,
+    ) -> bool {
+        if !state.selection_set.has_secondary() || state.ime_marked_range.is_some() {
+            return false;
+        }
+        state.indent_multiple(outdent, block, window, cx);
+        true
+    }
 
     fn hover_definition_style(
         state: &InputBaseState<Self>,
@@ -78,6 +133,12 @@ impl InputModeKind for EditorMode {
         window: &mut Window,
         cx: &mut gpui::Context<InputBaseState<Self>>,
     ) -> bool {
+        if event.button == gpui::MouseButton::Left && event.modifiers.alt && event.click_count == 1
+        {
+            let (_, affinity) = state.index_for_mouse_position(event.position);
+            state.toggle_caret(offset, affinity, cx);
+            return true;
+        }
         state.handle_click_hover_definition(event, offset, window, cx)
     }
 
@@ -165,6 +226,8 @@ impl InputModeKind for EditorMode {
         window: &mut Window,
     ) -> Stateful<Div> {
         element
+            .on_action(window.listener_for(entity, EditorState::select_next_occurrence))
+            .on_action(window.listener_for(entity, EditorState::select_all_occurrences))
             .on_action(window.listener_for(entity, InputBaseState::toggle_comment))
             .on_action(window.listener_for(entity, InputBaseState::on_action_toggle_code_actions))
             .on_action(window.listener_for(entity, InputBaseState::on_action_go_to_definition))
