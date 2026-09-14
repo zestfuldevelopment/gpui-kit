@@ -839,3 +839,65 @@ fn multi_cursor_word_at_eof_selects_then_adds_occurrences(cx: &mut TestAppContex
         })
         .unwrap();
 }
+
+#[gpui::test]
+fn multi_cursor_next_occurrence_reveals_deep_match_in_large_fold(cx: &mut TestAppContext) {
+    let view = InputView::new(cx);
+    let mut visual = VisualTestContext::from_window(view.window_handle.into(), cx);
+    visual.update(|window, cx| {
+        view.input.update(cx, |state, cx| {
+            state.set_value(
+                format!("one\nblock {{\n{}one\n}}\n", "other\n".repeat(150)),
+                window,
+                cx,
+            );
+            state.set_scroll_beyond_last_line(Some(0), window, cx);
+            state.set_selections(vec![EditorSelection::new(7, 0, 3)], 7, cx);
+            state.apply_highlighter_fold_candidates(vec![crate::input::FoldRange::new(1, 153)], cx);
+            state.display_map.set_folded(1, true);
+            state.focus(window, cx);
+        });
+    });
+    visual.run_until_parked();
+    visual.update(|_, cx| {
+        view.input.read_with(cx, |state, _| {
+            assert_eq!(state.display_map.folded_ranges().len(), 1);
+            assert!(
+                !state
+                    .last_layout
+                    .as_ref()
+                    .unwrap()
+                    .visible_buffer_lines
+                    .contains(&152)
+            );
+            eprintln!(
+                "folded scroll height {:?}, viewport {:?}, display rows {}, wrap rows {}",
+                state.scroll_size.height,
+                state.input_bounds.size.height,
+                state.display_map.display_row_count(),
+                state.display_map.wrap_row_count()
+            );
+        });
+    });
+    #[cfg(target_os = "macos")]
+    visual.simulate_keystrokes("cmd-d");
+    #[cfg(not(target_os = "macos"))]
+    visual.simulate_keystrokes("ctrl-d");
+    visual.run_until_parked();
+    visual.update(|_, cx| {
+        view.input.read_with(cx, |state, _| {
+            assert!(state.display_map.folded_ranges().is_empty());
+            assert_eq!(state.primary_selection_id(), 7);
+            assert_eq!(state.selections()[0], EditorSelection::new(7, 0, 3));
+            let layout = state.last_layout.as_ref().unwrap();
+            assert!(layout.visible_buffer_lines.contains(&152));
+            let carets = crate::input::element::TextElement::<EditorMode>::secondary_caret_bounds(
+                state,
+                layout,
+                &state.last_bounds.unwrap(),
+            );
+            assert_eq!(carets.len(), 1);
+            assert!(state.input_bounds.contains(&carets[0].center()));
+        });
+    });
+}
