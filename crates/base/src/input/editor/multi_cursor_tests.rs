@@ -901,3 +901,149 @@ fn multi_cursor_next_occurrence_reveals_deep_match_in_large_fold(cx: &mut TestAp
         });
     });
 }
+
+#[gpui::test]
+fn visible_primary_caret_survives_window_width_reflow(cx: &mut TestAppContext) {
+    let view = InputView::new(cx);
+    let mut visual = VisualTestContext::from_window(view.window_handle.into(), cx);
+    visual.simulate_resize(gpui::size(px(1200.), px(400.)));
+    let source: String = (1..=130)
+        .map(|line| {
+            format!(
+                "line {line:03}: café one 🦀 {}\r\n",
+                if line % 10 == 0 {
+                    "wrapped text ".repeat(25)
+                } else {
+                    String::new()
+                }
+            )
+        })
+        .collect();
+    visual.update(|window, cx| {
+        view.input.update(cx, |state, cx| {
+            state.set_value(source.clone(), window, cx);
+            state.focus(window, cx);
+        });
+    });
+    visual.run_until_parked();
+    let cursor = visual.update(|_, cx| {
+        view.input.update(cx, |state, cx| {
+            let cursor = state.text.line_start_offset(99);
+            state.set_selections(vec![EditorSelection::new(7, cursor, cursor)], 7, cx);
+            state.scroll_to(cursor, None, cx);
+            cursor
+        })
+    });
+    visual.run_until_parked();
+    let visible = |state: &crate::input::EditorState| {
+        let layout = state.last_layout.as_ref().unwrap();
+        let y = state.input_bounds.top()
+            + state.scroll_handle.offset().y
+            + layout.line_height * state.display_map.buffer_line_to_display_row(99);
+        eprintln!(
+            "viewport={:?}, scroll={:?}, display_row={}, caret_y={:?}, visible_lines={:?}",
+            state.input_bounds,
+            state.scroll_handle.offset(),
+            state.display_map.buffer_line_to_display_row(99),
+            y,
+            layout.visible_range
+        );
+        y >= state.input_bounds.top() && y + layout.line_height <= state.input_bounds.bottom()
+    };
+    visual.update(|_, cx| {
+        view.input.read_with(cx, |state, _| {
+            assert!(visible(state), "fixture starts with caret visible")
+        });
+    });
+    visual.simulate_resize(gpui::size(px(400.), px(400.)));
+    visual.run_until_parked();
+    visual.update(|_, cx| {
+        view.input.read_with(cx, |state, _| {
+            assert_eq!(state.value(), source);
+            assert_eq!(
+                state.selections(),
+                vec![EditorSelection::new(7, cursor, cursor)]
+            );
+            assert!(
+                visible(state),
+                "a visible primary caret must remain visible after width reflow"
+            );
+        });
+    });
+    // A deliberate scroll away must survive the reverse reflow as well.
+    visual.update(|_, cx| {
+        view.input.update(cx, |state, cx| {
+            state.update_scroll_offset(Some(point(px(0.), px(0.))), cx);
+        });
+    });
+    visual.run_until_parked();
+    visual.simulate_resize(gpui::size(px(1200.), px(400.)));
+    visual.run_until_parked();
+    visual.update(|_, cx| {
+        view.input.read_with(cx, |state, _| {
+            assert_eq!(state.scroll_handle.offset().y, px(0.));
+            assert_eq!(
+                state.selections(),
+                vec![EditorSelection::new(7, cursor, cursor)]
+            );
+            assert!(
+                !visible(state),
+                "resizing must respect deliberate scrolling away"
+            );
+        });
+    });
+}
+
+#[gpui::test]
+fn visible_caret_at_clipped_row_edge_survives_width_reflow(cx: &mut TestAppContext) {
+    let view = InputView::new(cx);
+    let mut visual = VisualTestContext::from_window(view.window_handle.into(), cx);
+    visual.simulate_resize(gpui::size(px(1200.), px(400.)));
+    visual.update(|window, cx| {
+        view.input.update(cx, |state, cx| {
+            state.set_value(
+                format!("{}\ncaret\n{}", "word ".repeat(2000), "tail\n".repeat(50)),
+                window,
+                cx,
+            );
+            state.focus(window, cx);
+        });
+    });
+    visual.run_until_parked();
+    visual.update(|_, cx| {
+        view.input.update(cx, |state, cx| {
+            let cursor = state.text.line_start_offset(1);
+            state.set_selections(vec![EditorSelection::new(7, cursor, cursor)], 7, cx);
+            state.scroll_to(cursor, None, cx);
+        });
+    });
+    visual.run_until_parked();
+    visual.update(|_, cx| {
+        view.input.update(cx, |state, cx| {
+            let row = state.display_map.buffer_line_to_display_row(1);
+            let y = -state.last_layout.as_ref().unwrap().line_height * row - px(1.);
+            state.update_scroll_offset(Some(point(px(0.), y)), cx);
+        });
+    });
+    visual.run_until_parked();
+    let caret_is_visible = |state: &crate::input::EditorState| {
+        let mut caret = state.last_layout.as_ref().unwrap().cursor_bounds.unwrap();
+        caret.origin.y += state.scroll_handle.offset().y;
+        eprintln!("edge caret={caret:?}, viewport={:?}", state.input_bounds);
+        caret.top() >= state.input_bounds.top() && caret.bottom() <= state.input_bounds.bottom()
+    };
+    visual.update(|_, cx| {
+        view.input
+            .read_with(cx, |state, _| assert!(caret_is_visible(state)))
+    });
+    visual.simulate_resize(gpui::size(px(400.), px(400.)));
+    visual.run_until_parked();
+    visual.update(|_, cx| {
+        view.input.read_with(cx, |state, _| {
+            assert!(
+                caret_is_visible(state),
+                "the visible caret must survive reflow even when its row is partially clipped"
+            );
+        })
+    });
+}

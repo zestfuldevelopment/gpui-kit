@@ -1839,8 +1839,52 @@ impl<M: InputModeKind> Element for TextElement<M> {
 
         if wrap_width_changed || wrapping_indent_changed {
             self.state.update(cx, |state, cx| {
+                // Rewrapping can move an unchanged caret by many display rows.
+                // Anchor only a caret that was visible before reflow: resizing
+                // must not undo a deliberate scroll away from the selection.
+                let caret_anchor = if wrap_width_changed
+                    && state.is_code_editor()
+                    && state.last_cursor == Some(state.cursor())
+                    && state.last_selected_range == Some(state.selected_range)
+                    && state.deferred_scroll_offset.is_none()
+                    && !state.auto_scroll.is_active()
+                {
+                    state.last_layout.as_ref().and_then(|layout| {
+                        let mut caret_bounds = layout.cursor_bounds?;
+                        caret_bounds.origin.y += state.scroll_handle.offset().y;
+                        if caret_bounds.top() < state.input_bounds.top()
+                            || caret_bounds.bottom() > state.input_bounds.bottom()
+                        {
+                            return None;
+                        }
+                        let caret = state
+                            .display_map
+                            .offset_to_wrap_display_point_with_affinity(
+                                state.cursor(),
+                                state.cursor_line_end_affinity,
+                            );
+                        let row = state.display_map.wrap_row_to_display_row(caret.row)?;
+                        Some(layout.line_height * row + state.scroll_handle.offset().y)
+                    })
+                } else {
+                    None
+                };
                 state.display_map.on_layout_changed(wrap_width, cx);
                 state.display_map.set_wrapping_indent(wrapping_indent, cx);
+                if let Some(y) = caret_anchor {
+                    let caret = state
+                        .display_map
+                        .offset_to_wrap_display_point_with_affinity(
+                            state.cursor(),
+                            state.cursor_line_end_affinity,
+                        );
+                    if let Some(row) = state.display_map.wrap_row_to_display_row(caret.row) {
+                        let mut offset = state.scroll_handle.offset();
+                        let y = y.min((bounds.size.height - window.line_height()).max(px(0.)));
+                        offset.y = (y - window.line_height() * row).min(px(0.));
+                        state.scroll_handle.set_offset(offset);
+                    }
+                }
             });
         }
 
