@@ -366,23 +366,169 @@ impl<M: crate::input::overlay::OverlayMode> Focusable for SearchPanel<M> {
     }
 }
 
-impl<M: crate::input::overlay::OverlayMode> Render for SearchPanel<M> {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if !self.session.open {
-            return Empty.into_any_element();
-        }
+impl<M: crate::input::overlay::OverlayMode> SearchPanel<M> {
+    // Keep native debug builds within Windows' 1 MiB main-thread stack.
+    // Build each region separately and erase its large builder type before
+    // returning, so their temporary values do not share one render frame.
+    fn render_search_options(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        h_flex()
+            .gap_1()
+            .child(
+                Button::new("case-insensitive")
+                    .track_focus(&self.case_focus)
+                    .selected(!self.session.case_insensitive)
+                    .toggled(!self.session.case_insensitive)
+                    .xsmall()
+                    .compact()
+                    .text()
+                    .icon(IconName::CaseSensitive)
+                    .tooltip("Match Case")
+                    .accessibility_label("Match Case")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.session.case_insensitive = !this.session.case_insensitive;
+                        this.update_search_query(cx);
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Button::new("whole-word")
+                    .track_focus(&self.word_focus)
+                    .selected(self.session.whole_word)
+                    .toggled(self.session.whole_word)
+                    .xsmall()
+                    .compact()
+                    .text()
+                    .label("Word")
+                    .tooltip("Whole Word")
+                    .accessibility_label("Whole Word")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let whole_word = !this.session.whole_word;
+                        this.session.whole_word = whole_word;
+                        let _ = this.editor.update(cx, |state, cx| {
+                            state.set_search_whole_word(whole_word, cx);
+                        });
+                    })),
+            )
+            .into_any_element()
+    }
 
-        let has_matches = !self.session.matcher.is_empty();
-        let allow_replace = self.replaceable(cx);
-        if !allow_replace {
-            self.session.replace_mode = false;
-        }
+    fn render_search_input(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        div()
+            .flex()
+            .flex_1()
+            .gap_1()
+            .child(
+                Input::new(&self.search_input)
+                    .aria_label("Find")
+                    .focus_bordered(true)
+                    .suffix(self.render_search_options(cx))
+                    .small()
+                    .w_full()
+                    .shadow_none(),
+            )
+            .on_prepaint({
+                let view = cx.entity();
+                move |bounds, _, cx| view.update(cx, |r, _| r.input_width = bounds.size.width)
+            })
+            .into_any_element()
+    }
 
+    fn render_replace_mode_button(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let replacement_visibility_label = if self.session.replace_mode {
             "Hide replacement"
         } else {
             "Show replacement"
         };
+        Button::new("replace-mode")
+            .track_focus(&self.replace_mode_focus)
+            .xsmall()
+            .ghost()
+            .icon(IconName::Replace)
+            .accessibility_label(replacement_visibility_label)
+            .tooltip(replacement_visibility_label)
+            .selected(self.session.replace_mode)
+            .toggled(self.session.replace_mode)
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.toggle_replace_mode(window, cx);
+            }))
+            .into_any_element()
+    }
+
+    fn render_previous_button(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        Button::new("prev")
+            .track_focus(&self.previous_focus)
+            .xsmall()
+            .ghost()
+            .icon(IconName::ChevronLeft)
+            .accessibility_label("Previous match")
+            .tooltip("Previous match (Shift+Enter)")
+            .disabled(self.session.matcher.is_empty())
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.prev(window, cx);
+            }))
+            .into_any_element()
+    }
+
+    fn render_next_button(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        Button::new("next")
+            .track_focus(&self.next_focus)
+            .xsmall()
+            .ghost()
+            .icon(IconName::ChevronRight)
+            .accessibility_label("Next match")
+            .tooltip("Next match (Enter)")
+            .disabled(self.session.matcher.is_empty())
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.next(window, cx);
+            }))
+            .into_any_element()
+    }
+
+    fn render_close_button(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        Button::new("close")
+            .track_focus(&self.close_focus)
+            .xsmall()
+            .ghost()
+            .icon(IconName::Close)
+            .accessibility_label("Close find")
+            .tooltip("Close find (Escape)")
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.on_action_escape(&Escape, window, cx);
+            }))
+            .into_any_element()
+    }
+
+    fn render_replace_current_button(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        Button::new("replace-one")
+            .track_focus(&self.replace_current_focus)
+            .small()
+            .label(t!("Input.Replace"))
+            .accessibility_label("Replace current match")
+            .tooltip("Replace current match with literal replacement text")
+            .disabled(self.session.matcher.is_empty())
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.replace_next(window, cx);
+            }))
+            .into_any_element()
+    }
+
+    fn render_replace_all_button(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        Button::new("replace-all")
+            .track_focus(&self.replace_all_focus)
+            .small()
+            .label(t!("Input.Replace All"))
+            .accessibility_label("Replace all matches")
+            .tooltip("Replace all matches with literal replacement text")
+            .disabled(self.session.matcher.is_empty())
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.replace_all(window, cx);
+            }))
+            .into_any_element()
+    }
+
+    fn render_find_row(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let has_matches = !self.session.matcher.is_empty();
+        let allow_replace = self.replaceable(cx);
         let match_label = if has_matches {
             format!(
                 "Match {} of {}",
@@ -392,6 +538,82 @@ impl<M: crate::input::overlay::OverlayMode> Render for SearchPanel<M> {
         } else {
             "No matches".to_owned()
         };
+        h_flex()
+            .w_full()
+            .gap_2()
+            .child(
+                div()
+                    .id("find-label")
+                    .w_12()
+                    .flex_shrink_0()
+                    .child(Label::new("Find"))
+                    .managed_tooltip(|window, cx| {
+                        Tooltip::new(
+                            "Find matches literal text. Regular expressions are not interpreted.",
+                        )
+                        .build(window, cx)
+                    }),
+            )
+            .child(self.render_search_input(cx))
+            .when(allow_replace, |this| {
+                this.child(self.render_replace_mode_button(cx))
+            })
+            .child(self.render_previous_button(cx))
+            .child(self.render_next_button(cx))
+            .child(
+                Label::new(match_label)
+                    .when(!has_matches, |this| {
+                        this.text_color(cx.theme().muted_foreground)
+                    })
+                    .text_left()
+                    .min_w_16(),
+            )
+            .child(div().w_7())
+            .child(self.render_close_button(cx))
+            .into_any_element()
+    }
+
+    fn render_replace_row(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        h_flex()
+            .w_full()
+            .gap_2()
+            .child(
+                div().id("replace-label").w_12().flex_shrink_0()
+                    .child(Label::new("Replace"))
+                    .managed_tooltip(|window, cx| {
+                        Tooltip::new("Replacement text is inserted literally. Leave empty to delete matches.")
+                            .build(window, cx)
+                    }),
+            )
+            .child(
+                Input::new(&self.replace_input)
+                    .aria_label("Replace")
+                    .focus_bordered(true)
+                    .small()
+                    .w(self.input_width)
+                    .shadow_none(),
+            )
+            .child(
+                self.render_replace_current_button(cx),
+            )
+            .child(
+                self.render_replace_all_button(cx),
+            )
+            .into_any_element()
+    }
+}
+
+impl<M: crate::input::overlay::OverlayMode> Render for SearchPanel<M> {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !self.session.open {
+            return Empty.into_any_element();
+        }
+
+        let allow_replace = self.replaceable(cx);
+        if !allow_replace {
+            self.session.replace_mode = false;
+        }
+
         v_flex()
             .id("search-panel")
             .occlude()
@@ -415,195 +637,12 @@ impl<M: crate::input::overlay::OverlayMode> Render for SearchPanel<M> {
             .border_b_1()
             .rounded(cx.theme().radius.half())
             .border_color(cx.theme().border)
-            .child(
-                h_flex()
-                    .w_full()
-                    .gap_2()
-                    .child(
-                        div().id("find-label").w_12().flex_shrink_0()
-                            .child(Label::new("Find"))
-                            .managed_tooltip(|window, cx| {
-                                Tooltip::new("Find matches literal text. Regular expressions are not interpreted.")
-                                    .build(window, cx)
-                            }),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_1()
-                            .gap_1()
-                            .child(
-                                Input::new(&self.search_input)
-                                    .aria_label("Find")
-                                    .focus_bordered(true)
-                                    .suffix(
-                                        h_flex()
-                                            .gap_1()
-                                            .child(
-                                                Button::new("case-insensitive")
-                                                    .track_focus(&self.case_focus)
-                                                    .selected(!self.session.case_insensitive)
-                                                    .toggled(!self.session.case_insensitive)
-                                                    .xsmall()
-                                                    .compact()
-                                                    .text()
-                                                    .icon(IconName::CaseSensitive)
-                                                    .tooltip("Match Case")
-                                                    .accessibility_label("Match Case")
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.session.case_insensitive =
-                                                            !this.session.case_insensitive;
-                                                        this.update_search_query(cx);
-                                                        cx.notify();
-                                                    })),
-                                            )
-                                            .child(
-                                                Button::new("whole-word")
-                                                    .track_focus(&self.word_focus)
-                                                    .selected(self.session.whole_word)
-                                                    .toggled(self.session.whole_word)
-                                                    .xsmall()
-                                                    .compact()
-                                                    .text()
-                                                    .label("Word")
-                                                    .tooltip("Whole Word")
-                                                    .accessibility_label("Whole Word")
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        let whole_word = !this.session.whole_word;
-                                                        this.session.whole_word = whole_word;
-                                                        let _ =
-                                                            this.editor.update(cx, |state, cx| {
-                                                                state.set_search_whole_word(
-                                                                    whole_word, cx,
-                                                                );
-                                                            });
-                                                    })),
-                                            ),
-                                    )
-                                    .small()
-                                    .w_full()
-                                    .shadow_none(),
-                            )
-                            .on_prepaint({
-                                let view = cx.entity();
-                                move |bounds, _, cx| {
-                                    view.update(cx, |r, _| r.input_width = bounds.size.width)
-                                }
-                            }),
-                    )
-                    .when(allow_replace, |this| {
-                        this.child(
-                            Button::new("replace-mode")
-                                .track_focus(&self.replace_mode_focus)
-                                .xsmall()
-                                .ghost()
-                                .icon(IconName::Replace)
-                                .accessibility_label(replacement_visibility_label)
-                                .tooltip(replacement_visibility_label)
-                                .selected(self.session.replace_mode)
-                                .toggled(self.session.replace_mode)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.toggle_replace_mode(window, cx);
-                                })),
-                        )
-                    })
-                    .child(
-                        Button::new("prev")
-                            .track_focus(&self.previous_focus)
-                            .xsmall()
-                            .ghost()
-                            .icon(IconName::ChevronLeft)
-                            .accessibility_label("Previous match")
-                            .tooltip("Previous match (Shift+Enter)")
-                            .disabled(!has_matches)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.prev(window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("next")
-                            .track_focus(&self.next_focus)
-                            .xsmall()
-                            .ghost()
-                            .icon(IconName::ChevronRight)
-                            .accessibility_label("Next match")
-                            .tooltip("Next match (Enter)")
-                            .disabled(!has_matches)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.next(window, cx);
-                            })),
-                    )
-                    .child(
-                        Label::new(match_label)
-                            .when(!has_matches, |this| {
-                                this.text_color(cx.theme().muted_foreground)
-                            })
-                            .text_left()
-                            .min_w_16(),
-                    )
-                    .child(div().w_7())
-                    .child(
-                        Button::new("close")
-                            .track_focus(&self.close_focus)
-                            .xsmall()
-                            .ghost()
-                            .icon(IconName::Close)
-                            .accessibility_label("Close find")
-                            .tooltip("Close find (Escape)")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.on_action_escape(&Escape, window, cx);
-                            })),
-                    ),
-            )
+            .child(self.render_find_row(cx))
             .when_some(self.session.matcher.error(), |this, error| {
                 this.child(Label::new(error.to_owned()).text_color(cx.theme().danger))
             })
             .when(self.session.replace_mode && allow_replace, |this| {
-                this.child(
-                    h_flex()
-                        .w_full()
-                        .gap_2()
-                        .child(
-                            div().id("replace-label").w_12().flex_shrink_0()
-                                .child(Label::new("Replace"))
-                                .managed_tooltip(|window, cx| {
-                                    Tooltip::new("Replacement text is inserted literally. Leave empty to delete matches.")
-                                        .build(window, cx)
-                                }),
-                        )
-                        .child(
-                            Input::new(&self.replace_input)
-                                .aria_label("Replace")
-                                .focus_bordered(true)
-                                .small()
-                                .w(self.input_width)
-                                .shadow_none(),
-                        )
-                        .child(
-                            Button::new("replace-one")
-                                .track_focus(&self.replace_current_focus)
-                                .small()
-                                .label(t!("Input.Replace"))
-                                .accessibility_label("Replace current match")
-                                .tooltip("Replace current match with literal replacement text")
-                                .disabled(!has_matches)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.replace_next(window, cx);
-                                })),
-                        )
-                        .child(
-                            Button::new("replace-all")
-                                .track_focus(&self.replace_all_focus)
-                                .small()
-                                .label(t!("Input.Replace All"))
-                                .accessibility_label("Replace all matches")
-                                .tooltip("Replace all matches with literal replacement text")
-                                .disabled(!has_matches)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.replace_all(window, cx);
-                                })),
-                        ),
-                )
+                this.child(self.render_replace_row(cx))
             })
             .into_any_element()
     }
